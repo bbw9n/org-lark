@@ -49,7 +49,7 @@ Or from Lisp:
 
 ```elisp
 (org-lark-export
- "https://bytedance.larkoffice.com/docx/PUardkIAQosQDfx0PTecPpsanIc"
+ "https://your-lark-doc"
  "~/notes/lark-parser-test.org")
 ```
 
