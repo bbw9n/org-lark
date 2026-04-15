@@ -1,16 +1,15 @@
 #+title: org-lark
 
-Export Lark/Feishu cloud documents to Org files.
+Export Lark/Feishu documents to Org files.
 
-Fetches Markdown from =lark-cli=, normalizes Lark-specific custom
-blocks (tables, callouts, grids, OKR, ...), and converts to Org with a
-single Pandoc call.
+Fetches Markdown via [[https://github.com/larksuite/cli][lark-cli]], normalizes Lark-specific custom blocks
+(tables, qoutes, callouts, grids, ...), and converts into an Org file
 
 * Requirements
 
 - Emacs 27.1+
-- =lark-cli= (configured and authorized)
-- =pandoc=
+- [[https://github.com/larksuite/cli][lark-cli]] (configured and authorized)
+- [[https://pandoc.org/][pandoc]]
 
 * Install
 
@@ -32,26 +31,31 @@ M-x org-lark-export
 M-x org-lark-export-url-at-point
 #+end_src
 
+The minibuffer shows short status messages during export:
+
+: org-lark: fetching...
+: org-lark: converting...
+: org-lark: downloading media 3/12...
+: org-lark: running pandoc...
+: org-lark: done → export.org
+
 * Debugging
 
 =M-x org-lark-toggle-debug= opens a read-only =*org-lark-log*= buffer
-with timestamped logs for every step: subprocess commands, tag
-processing, media downloads, and timing.
-
-The minibuffer always shows the currently running shell command with an
-elapsed-time counter.
+with timestamped details: full shell commands, exit codes, byte counts,
+tag match counts, and per-step timing.
 
 * Customization
 
-| Variable                       | Default     | Description                      |
-|--------------------------------+-------------+----------------------------------|
-| =org-lark-cli-program=        | ="lark-cli"= | Path to lark-cli                 |
-| =org-lark-pandoc-program=     | ="pandoc"=  | Path to pandoc                   |
-| =org-lark-identity=           | ="user"=    | =--as= identity for lark-cli    |
-| =org-lark-download-media=     | =t=         | Download images/files/whiteboards |
-| =org-lark-assets-directory=   | ="assets"=  | Asset sub-directory              |
-| =org-lark-timeout=            | =30=        | Seconds before killing a subprocess |
-| =org-lark-debug=              | =nil=       | Log to =*org-lark-log*=         |
+| Variable                     | Default     | Description                         |
+|------------------------------+-------------+-------------------------------------|
+| =org-lark-cli-program=      | ="lark-cli"= | Path to lark-cli                    |
+| =org-lark-pandoc-program=   | ="pandoc"=  | Path to pandoc                      |
+| =org-lark-identity=         | ="user"=    | =--as= identity for lark-cli       |
+| =org-lark-download-media=   | =t=         | Download images/files/whiteboards   |
+| =org-lark-assets-directory= | ="assets"=  | Asset sub-directory                 |
+| =org-lark-timeout=          | =30=        | Seconds before killing a subprocess |
+| =org-lark-debug=            | =nil=       | Log to =*org-lark-log*= buffer     |
 
 * Tests
 

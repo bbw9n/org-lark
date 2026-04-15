@@ -106,7 +106,8 @@ Only active when `org-lark-debug' is non-nil."
 
 (cl-defstruct org-lark--state
   "Mutable bag threaded through a single export."
-  output-file asset-dir (placeholders nil) (counter 0))
+  output-file asset-dir (placeholders nil) (counter 0)
+  (media-done 0) (media-total 0))
 
 (defconst org-lark--ph-prefix "ORGLARKPH"
   "Placeholder token prefix.  Unlikely to collide with document text.")
@@ -128,8 +129,8 @@ Only active when `org-lark-debug' is non-nil."
                  (not (y-or-n-p (format "Overwrite %s? " output-file)))
                t))
     (user-error "Refusing to overwrite %s" output-file))
-  (org-lark--log "export start doc=%s output=%s" doc output-file)
-  (org-lark--msg "fetching %s" doc)
+  (org-lark--log "export doc=%s → %s" doc output-file)
+  (org-lark--msg "fetching...")
   (let* ((fetched (org-lark-fetch doc))
          (st (make-org-lark--state
               :output-file (expand-file-name output-file)
@@ -137,16 +138,19 @@ Only active when `org-lark-debug' is non-nil."
                           org-lark-assets-directory
                           (file-name-directory
                            (expand-file-name output-file))))))
-    (org-lark--log "fetch complete: title=%s markdown=%d chars"
+    (org-lark--log "fetched \"%s\" (%d chars)"
                    (alist-get 'title fetched)
                    (length (alist-get 'markdown fetched)))
-    (org-lark--msg "converting %d chars..." (length (alist-get 'markdown fetched)))
+    (when org-lark-download-media
+      (setf (org-lark--state-media-total st)
+            (org-lark--count-media (alist-get 'markdown fetched))))
+    (org-lark--msg "converting...")
     (let ((org (org-lark--pipeline (alist-get 'markdown fetched)
                                    fetched doc st)))
       (make-directory (file-name-directory (expand-file-name output-file)) t)
       (with-temp-file output-file (insert org))
-      (org-lark--log "export complete: %d chars → %s" (length org) output-file)
-      (org-lark--msg "wrote %s" output-file)
+      (org-lark--log "wrote %s (%d chars)" output-file (length org))
+      (org-lark--msg "done → %s" (file-name-nondirectory output-file))
       output-file)))
 
 ;;;###autoload
@@ -181,20 +185,18 @@ Return alist with keys `markdown', `title', `doc_id'."
   "Full pipeline: Lark MARKDOWN to finished Org string.
 FETCHED holds metadata, SOURCE is the original URL/token."
   (let ((t0 (float-time)))
-    (org-lark--log "pipeline start: %d chars" (length markdown))
-    (let* ((text (progn (org-lark--log "protect code blocks")
-                        (org-lark--protect-code-blocks markdown st)))
-           (text (progn (org-lark--log "normalize tags (%d chars)" (length text))
-                        (org-lark--normalize-tags text st)))
-           (org  (progn (org-lark--log "pandoc (%d chars, %d placeholders)"
-                                       (length text) (org-lark--state-counter st))
-                        (org-lark--pandoc text)))
-           (org  (progn (org-lark--log "restore %d placeholders"
-                                       (length (org-lark--state-placeholders st)))
-                        (org-lark--restore-placeholders org st)))
+    (org-lark--log "pipeline: %d chars input" (length markdown))
+    (let* ((text (org-lark--protect-code-blocks markdown st))
+           (_    (org-lark--log "  code blocks → %d placeholders"
+                                (org-lark--state-counter st)))
+           (text (org-lark--normalize-tags text st))
+           (_    (org-lark--log "  tags normalized → %d placeholders, %d chars for pandoc"
+                                (org-lark--state-counter st) (length text)))
+           (org  (org-lark--pandoc text))
+           (org  (org-lark--restore-placeholders org st))
            (org  (org-lark--fix-deep-headings org))
            (org  (replace-regexp-in-string "\n\\{3,\\}" "\n\n" (string-trim org))))
-      (org-lark--log "pipeline done in %.2fs" (- (float-time) t0))
+      (org-lark--log "pipeline: %.2fs total" (- (float-time) t0))
       (concat "#+title: " (or (alist-get 'title fetched) "Lark export") "\n"
               (let ((id (alist-get 'doc_id fetched)))
                 (if id (format "#+lark_doc_id: %s\n" id) ""))
@@ -466,10 +468,27 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 
 ;;;; Media download ────────────────────────────────────────────────
 
+(defun org-lark--count-media (markdown)
+  "Count the number of media tags in MARKDOWN for progress reporting."
+  (with-temp-buffer
+    (insert markdown)
+    (let ((n 0))
+      (goto-char (point-min))
+      (while (re-search-forward
+              "<\\(?:image\\|whiteboard\\|file\\)[ \t\n]" nil t)
+        (cl-incf n))
+      n)))
+
 (defun org-lark--download-media (token type st)
   "Download media TOKEN of TYPE.  Return local path or nil."
   (when (and org-lark-download-media token)
-    (org-lark--log "media download token=%s type=%s" token (or type "auto"))
+    (cl-incf (org-lark--state-media-done st))
+    (let ((total (org-lark--state-media-total st))
+          (done  (org-lark--state-media-done st)))
+      (if (> total 0)
+          (org-lark--msg "downloading media %d/%d..." done total)
+        (org-lark--msg "downloading media %d..." done)))
+    (org-lark--log "media token=%s type=%s" token (or type "auto"))
     (make-directory (org-lark--state-asset-dir st) t)
     (let* ((base (expand-file-name
                   (concat (org-lark--safe-filename token)
@@ -488,9 +507,9 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
           (if (alist-get 'ok json)
               (let ((path (or (alist-get 'saved_path data)
                               (alist-get 'output data) base)))
-                (org-lark--log "media saved → %s" path)
+                (org-lark--log "  saved → %s" path)
                 path)
-            (org-lark--log "media error for token=%s" token)
+            (org-lark--log "media error token=%s" token)
             nil))))))
 
 ;;;; Placeholders ──────────────────────────────────────────────────
@@ -552,15 +571,13 @@ FUNC is called with (ATTRS BODY) strings."
 
 (defun org-lark--run (program &rest args)
   "Run PROGRAM with ARGS.  Return stdout.
-Uses `make-process' with a deadline so Emacs stays responsive.
-Shows the running command in the minibuffer while waiting."
-  (let* ((cmd (format "%s %s" (file-name-nondirectory program)
-                      (mapconcat #'shell-quote-argument args " ")))
+Uses `make-process' with a deadline so Emacs stays responsive."
+  (let* ((bin  (file-name-nondirectory program))
+         (cmd  (format "%s %s" bin (mapconcat #'shell-quote-argument args " ")))
          (stdout-buf (generate-new-buffer " *org-lark*"))
          (stderr-buf (generate-new-buffer " *org-lark-err*"))
          (t0 (float-time)))
-    (org-lark--log "run: %s" cmd)
-    (org-lark--msg "$ %s" cmd)
+    (org-lark--log "$ %s" cmd)
     (unwind-protect
         (let* ((proc (make-process
                       :name "org-lark"
@@ -572,23 +589,21 @@ Shows the running command in the minibuffer while waiting."
                       :sentinel #'ignore))
                (deadline (+ (float-time) org-lark-timeout)))
           (while (process-live-p proc)
-            (org-lark--msg "$ %s  [%.0fs]" cmd (- (float-time) t0))
             (accept-process-output proc 1)
             (when (> (float-time) deadline)
               (delete-process proc)
-              (org-lark--log "TIMEOUT after %ds: %s" org-lark-timeout cmd)
-              (user-error "org-lark: timed out (%ds): %s" org-lark-timeout cmd)))
+              (org-lark--log "TIMEOUT %ds: %s" org-lark-timeout cmd)
+              (user-error "org-lark: %s timed out (%ds)" bin org-lark-timeout)))
           (accept-process-output proc 0.1)
           (let ((exit-code (process-exit-status proc))
                 (out-len (with-current-buffer stdout-buf (buffer-size)))
                 (elapsed (- (float-time) t0)))
-            (org-lark--log "done %.2fs exit=%d %d bytes: %s"
-                           elapsed exit-code out-len cmd)
+            (org-lark--log "  → %.1fs, exit %d, %d bytes" elapsed exit-code out-len)
             (unless (zerop exit-code)
               (let ((err (with-current-buffer stderr-buf
                            (string-trim (buffer-string)))))
-                (org-lark--log "FAILED: %s" err)
-                (user-error "org-lark: %s (exit %d): %s" cmd exit-code err)))
+                (org-lark--log "  FAILED: %s" err)
+                (user-error "org-lark: %s failed (exit %d): %s" bin exit-code err)))
             (with-current-buffer stdout-buf (buffer-string))))
       (ignore-errors (kill-buffer stdout-buf))
       (ignore-errors (kill-buffer stderr-buf)))))
@@ -600,6 +615,7 @@ Shows the running command in the minibuffer while waiting."
 
 (defun org-lark--pandoc (markdown)
   "Convert MARKDOWN to Org with a single Pandoc call."
+  (org-lark--msg "running pandoc...")
   (let ((in-file (make-temp-file "org-lark-" nil ".md")))
     (unwind-protect
         (progn
