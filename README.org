@@ -1,0 +1,60 @@
+#+title: org-lark
+
+Export Lark/Feishu cloud documents to Org files.
+
+Fetches Markdown from =lark-cli=, normalizes Lark-specific custom
+blocks (tables, callouts, grids, OKR, ...), and converts to Org with a
+single Pandoc call.
+
+* Requirements
+
+- Emacs 27.1+
+- =lark-cli= (configured and authorized)
+- =pandoc=
+
+* Install
+
+#+begin_src elisp
+(add-to-list 'load-path "/path/to/org-lark")
+(require 'org-lark)
+#+end_src
+
+* Usage
+
+#+begin_src elisp
+;; Interactive
+M-x org-lark-export
+
+;; From Lisp
+(org-lark-export "https://your-lark-doc" "~/notes/export.org")
+
+;; Export URL at point
+M-x org-lark-export-url-at-point
+#+end_src
+
+* Debugging
+
+=M-x org-lark-toggle-debug= opens a read-only =*org-lark-log*= buffer
+with timestamped logs for every step: subprocess commands, tag
+processing, media downloads, and timing.
+
+The minibuffer always shows the currently running shell command with an
+elapsed-time counter.
+
+* Customization
+
+| Variable                       | Default     | Description                      |
+|--------------------------------+-------------+----------------------------------|
+| =org-lark-cli-program=        | ="lark-cli"= | Path to lark-cli                 |
+| =org-lark-pandoc-program=     | ="pandoc"=  | Path to pandoc                   |
+| =org-lark-identity=           | ="user"=    | =--as= identity for lark-cli    |
+| =org-lark-download-media=     | =t=         | Download images/files/whiteboards |
+| =org-lark-assets-directory=   | ="assets"=  | Asset sub-directory              |
+| =org-lark-timeout=            | =30=        | Seconds before killing a subprocess |
+| =org-lark-debug=              | =nil=       | Log to =*org-lark-log*=         |
+
+* Tests
+
+#+begin_src sh
+emacs -Q --batch -L . -l test/org-lark-test.el -f ert-run-tests-batch-and-exit
+#+end_src
