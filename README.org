@@ -4,6 +4,7 @@ Export Lark/Feishu documents to Org files.
 
 Fetches Markdown via [[https://github.com/larksuite/cli][lark-cli]], normalizes Lark-specific custom blocks
 (tables, quotes, callouts, grids, ...), and converts into an Org file.
+See the full sample export: [[file:example/exported.org][example/exported.org]]
 
 * Requirements
 
