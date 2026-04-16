@@ -35,6 +35,10 @@
                           '((title . "Test") (doc_id . "d1"))
                           "test-url" st))))
 
+(defun org-lark-test--arg-after (flag args)
+  "Return the value after FLAG in ARGS."
+  (cadr (member flag args)))
+
 ;;; Tests ──────────────────────────────────────────────────────────
 
 (ert-deftest org-lark-test-quote-and-callout ()
@@ -102,14 +106,75 @@
       (should (equal (alist-get 'doc_id fetched) "doc1")))))
 
 (ert-deftest org-lark-test-media-download-path ()
-  (cl-letf (((symbol-function 'org-lark--run-json)
-             (lambda (_program &rest _args)
+  (let (seen-args)
+    (cl-letf (((symbol-function 'org-lark--run-json)
+             (lambda (_program &rest args)
+               (setq seen-args args)
                '((ok . t)
-                 (data . ((saved_path . "/tmp/org-lark-asset.png")))))))
-    (let ((st (org-lark-test--st))
-          (org-lark-download-media t))
-      (should (equal (org-lark--download-media "tok" nil st)
-                     "/tmp/org-lark-asset.png")))))
+                 (data . ((saved_path . "assets/tok.png")))))))
+      (let ((st (org-lark-test--st))
+            (org-lark-download-media t))
+        (should (equal (org-lark--download-media "tok" nil st)
+                       (expand-file-name "assets/tok.png" temporary-file-directory)))
+        (should (equal (org-lark-test--arg-after "--output" seen-args)
+                       "assets/tok"))
+        (should-not (file-name-absolute-p
+                     (org-lark-test--arg-after "--output" seen-args)))))))
+
+(ert-deftest org-lark-test-image-token-downloads-to-embedded-file-link ()
+  (let (seen-args)
+    (org-lark-test--with-pandoc-stub
+      (let* ((st (org-lark-test--st))
+             (saved-path (expand-file-name "img-token.png"
+                                           (org-lark--state-asset-dir st)))
+             (org-lark-download-media t))
+        (cl-letf (((symbol-function 'org-lark--run-json)
+                   (lambda (_program &rest args)
+                     (setq seen-args args)
+                     `((ok . t)
+                       (data . ((saved_path . ,saved-path)))))))
+          (let* ((org-lark-download-media t)
+                 (out (org-lark--pipeline
+                       "<image token=\"img-token\" width=\"640\" align=\"center\"/>"
+                       '((title . "T") (doc_id . "d1")) "u" st)))
+            (should (member "+media-download" seen-args))
+            (should (member "--token" seen-args))
+            (should (member "img-token" seen-args))
+            (should (equal (org-lark-test--arg-after "--output" seen-args)
+                           "assets/img-token"))
+            (should-not (file-name-absolute-p
+                         (org-lark-test--arg-after "--output" seen-args)))
+            (should-not (member "whiteboard" seen-args))
+            (should (string-match-p "#\\+attr_org: .*:width 640" out))
+            (should (string-match-p "\\[\\[file:assets/img-token.png\\]\\]" out))))))))
+
+(ert-deftest org-lark-test-whiteboard-token-downloads-thumbnail-link ()
+  (let (seen-args)
+    (org-lark-test--with-pandoc-stub
+      (let* ((st (org-lark-test--st))
+             (saved-path (expand-file-name "wb-token.png"
+                                           (org-lark--state-asset-dir st)))
+             (org-lark-download-media t))
+        (cl-letf (((symbol-function 'org-lark--run-json)
+                   (lambda (_program &rest args)
+                     (setq seen-args args)
+                     `((ok . t)
+                       (data . ((saved_path . ,saved-path)))))))
+          (let* ((org-lark-download-media t)
+                 (out (org-lark--pipeline
+                       "<whiteboard token=\"wb-token\" align=\"left\"/>"
+                       '((title . "T") (doc_id . "d1")) "u" st)))
+            (should (member "+media-download" seen-args))
+            (should (member "--token" seen-args))
+            (should (member "wb-token" seen-args))
+            (should (member "--type" seen-args))
+            (should (member "whiteboard" seen-args))
+            (should (equal (org-lark-test--arg-after "--output" seen-args)
+                           "assets/wb-token-wb"))
+            (should-not (file-name-absolute-p
+                         (org-lark-test--arg-after "--output" seen-args)))
+            (should (string-match-p "#\\+attr_org: .*:align left" out))
+            (should (string-match-p "\\[\\[file:assets/wb-token.png\\]\\]" out))))))))
 
 (ert-deftest org-lark-test-grid-and-columns ()
   (let ((out (org-lark-test--convert

@@ -490,23 +490,30 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
         (org-lark--msg "downloading media %d..." done)))
     (org-lark--log "media token=%s type=%s" token (or type "auto"))
     (make-directory (org-lark--state-asset-dir st) t)
-    (let* ((base (expand-file-name
-                  (concat (org-lark--safe-filename token)
-                          (when (string= type "whiteboard") "-wb"))
-                  (org-lark--state-asset-dir st)))
+    (let* ((output-dir (file-name-directory (org-lark--state-output-file st)))
+           (relative-output
+            (file-name-as-directory
+             (file-relative-name (org-lark--state-asset-dir st) output-dir)))
+           (base-name (concat (org-lark--safe-filename token)
+                              (when (string= type "whiteboard") "-wb")))
+           (base (concat relative-output base-name))
            (args (append (list "docs" "+media-download"
                                "--as" org-lark-identity
                                "--token" token "--output" base)
                          (when type (list "--type" type))))
            (json (condition-case err
-                     (apply #'org-lark--run-json org-lark-cli-program args)
+                     (let ((default-directory output-dir))
+                       (apply #'org-lark--run-json org-lark-cli-program args))
                    (error (org-lark--log "media FAILED: %s" (error-message-string err))
                           nil))))
       (when json
         (let ((data (alist-get 'data json)))
           (if (alist-get 'ok json)
-              (let ((path (or (alist-get 'saved_path data)
-                              (alist-get 'output data) base)))
+              (let* ((path (or (alist-get 'saved_path data)
+                               (alist-get 'output data) base))
+                     (path (if (file-name-absolute-p path)
+                               path
+                             (expand-file-name path output-dir))))
                 (org-lark--log "  saved → %s" path)
                 path)
             (org-lark--log "media error token=%s" token)

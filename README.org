@@ -3,7 +3,7 @@
 Export Lark/Feishu documents to Org files.
 
 Fetches Markdown via [[https://github.com/larksuite/cli][lark-cli]], normalizes Lark-specific custom blocks
-(tables, qoutes, callouts, grids, ...), and converts into an Org file
+(tables, quotes, callouts, grids, ...), and converts into an Org file.
 
 * Requirements
 
@@ -38,6 +38,18 @@ The minibuffer shows short status messages during export:
 : org-lark: downloading media 3/12...
 : org-lark: running pandoc...
 : org-lark: done → export.org
+
+Image and whiteboard tokens are downloaded automatically when
+=org-lark-download-media= is non-nil.  The exporter calls
+=lark-cli docs +media-download --token TOKEN= from the Org file's
+directory, passes a relative =--output= path such as =assets/TOKEN=,
+saves the result under the configured assets directory, and emits an
+Org image link such as:
+
+#+begin_src org
+#+attr_org: :width 640 :align center
+[[file:assets/example.png]]
+#+end_src
 
 * Debugging
 
