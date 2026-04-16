@@ -105,6 +105,28 @@
       (should (equal (alist-get 'title fetched) "My Doc"))
       (should (equal (alist-get 'doc_id fetched) "doc1")))))
 
+(ert-deftest org-lark-test-noninteractive-export-does-not-open-file ()
+  (let ((opened nil)
+        (output (expand-file-name "org-lark-export-test.org"
+                                  temporary-file-directory)))
+    (unwind-protect
+        (org-lark-test--with-pandoc-stub
+          (cl-letf (((symbol-function 'org-lark-fetch)
+                     (lambda (_doc)
+                       '((markdown . "# Hello")
+                         (title . "My Doc")
+                         (doc_id . "doc1"))))
+                    ((symbol-function 'find-file)
+                     (lambda (&rest _args)
+                       (setq opened t))))
+            (let ((org-lark-overwrite t)
+                  (org-lark-open-after-export t)
+                  (org-lark-download-media nil))
+              (should (equal (org-lark-export "doc" output) output))
+              (should-not opened)
+              (should (file-exists-p output)))))
+      (delete-file output t))))
+
 (ert-deftest org-lark-test-media-download-path ()
   (let (seen-args)
     (cl-letf (((symbol-function 'org-lark--run-json)

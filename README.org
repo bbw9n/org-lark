@@ -67,6 +67,7 @@ tag match counts, and per-step timing.
 | =org-lark-download-media=   | =t=         | Download images/files/whiteboards   |
 | =org-lark-assets-directory= | ="assets"=  | Asset sub-directory                 |
 | =org-lark-timeout=          | =30=        | Seconds before killing a subprocess |
+| =org-lark-open-after-export= | =t=         | Visit converted file after export   |
 | =org-lark-debug=            | =nil=       | Log to =*org-lark-log*= buffer     |
 
 * Tests

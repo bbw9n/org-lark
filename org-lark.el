@@ -64,6 +64,10 @@
   "Whether to overwrite an existing output file without asking."
   :type 'boolean)
 
+(defcustom org-lark-open-after-export t
+  "Whether interactive exports should visit the generated Org file."
+  :type 'boolean)
+
 (defcustom org-lark-debug nil
   "When non-nil, log to the *org-lark-log* buffer.
 Toggle interactively with `org-lark-toggle-debug'."
@@ -148,10 +152,14 @@ Only active when `org-lark-debug' is non-nil."
     (let ((org (org-lark--pipeline (alist-get 'markdown fetched)
                                    fetched doc st)))
       (make-directory (file-name-directory (expand-file-name output-file)) t)
-      (with-temp-file output-file (insert org))
-      (org-lark--log "wrote %s (%d chars)" output-file (length org))
-      (org-lark--msg "done → %s" (file-name-nondirectory output-file))
-      output-file)))
+      (let ((output-file (expand-file-name output-file)))
+        (with-temp-file output-file (insert org))
+        (org-lark--log "wrote %s (%d chars)" output-file (length org))
+        (when (and org-lark-open-after-export
+                   (called-interactively-p 'interactive))
+          (find-file output-file))
+        (org-lark--msg "done → %s" (file-name-nondirectory output-file))
+        output-file))))
 
 ;;;###autoload
 (defun org-lark-export-url-at-point (output-file)
