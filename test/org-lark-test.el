@@ -46,7 +46,8 @@
               "<quote-container>\n**hello**\n</quote-container>\n\n<callout emoji=\"dizzy\" background-color=\"light-orange\">\n# title\n</callout>")))
     (should (string-match-p "\\+begin_quote" out))
     (should (string-match-p "\\*hello\\*" out))
-    (should (string-match-p "\\+begin_lark_callout" out))
+    (should (string-match-p "\\+begin_example" out))
+    (should (string-match-p "\\+end_example" out))
     (should (string-match-p ":emoji dizzy" out))))
 
 (ert-deftest org-lark-test-deep-heading-and-placeholder ()

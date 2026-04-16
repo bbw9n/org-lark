@@ -262,7 +262,7 @@ FETCHED holds metadata, SOURCE is the original URL/token."
     ((or "quote-container" "quote")
      (org-lark--wrap-block attrs body st "quote"))
     ("callout"
-     (org-lark--wrap-block attrs body st "lark_callout"))
+     (org-lark--wrap-block attrs body st "example"))
     ("lark-table"
      (org-lark--tag-table attrs body st))
     ("grid"

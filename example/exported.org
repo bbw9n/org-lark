@@ -34,10 +34,10 @@ The first step is to get your account set up and your applications installed. Th
 #+end_lark_grid
 
 #+attr_org: :emoji 💡 :background-color light-yellow :border-color light-yellow
-#+begin_lark_callout
+#+begin_example
 
 *Tip:* Complete your profile with a photo and contact information. This helps your colleagues get to know you! 
-#+end_lark_callout
+#+end_example
 
 **** Onboarding Checklist
 :PROPERTIES:
@@ -105,10 +105,10 @@ Here is the typical flow for scheduling a meeting in Lark:
 [[file:assets/YbI8wHMlbhRxHRbBppkj4Clopmg-wb.jpg]]
 
 #+attr_org: :emoji speech_balloon :background-color light-blue :border-color light-blue
-#+begin_lark_callout
+#+begin_example
 
 *Best Practice:* Use threads to reply to specific messages in group chats. This keeps the main channel clean and easy to read. 
-#+end_lark_callout
+#+end_example
 
 --------------
 
@@ -252,7 +252,7 @@ This interactive chart shows a typical user adoption curve for a new team starti
 [[https://www.youtube.com/watch?v=th8u0bqYsQk][Lark iframe]]
 
 #+attr_org: :emoji ⭐ :background-color light-green :border-color light-green
-#+begin_lark_callout
+#+begin_example
 
 *Congratulations!* You've completed the Lark Getting Started guide. You're now ready to collaborate effectively with your team. 
-#+end_lark_callout
+#+end_example
