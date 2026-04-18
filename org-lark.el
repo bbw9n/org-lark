@@ -233,6 +233,7 @@ FETCHED holds metadata, SOURCE is the original URL/token."
 
 (defun org-lark--normalize-tags (text st)
   "Replace all Lark custom tags in TEXT with placeholders or Markdown."
+  (setq text (org-lark--flatten-nested text st))
   (dolist (tag '("equation" "quote-container" "quote" "callout"
                  "lark-table" "grid" "agenda" "source-synced"
                  "reference-synced" "okr" "view" "text" "mention-doc"))
@@ -348,6 +349,149 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
                           st)
             (string-trim inner)
             (org-lark--ph "\n#+end_lark_grid\n" st))))
+
+;;; Nesting pre-pass (quote-in-table, grid-in-table, table-in-grid)
+
+(defun org-lark--flatten-nested (text st)
+  "Pre-pass: strip quotes in tables, flatten nested table/grid to lists."
+  (setq text (org-lark--preprocess-tables text st))
+  (setq text (org-lark--preprocess-grids text st))
+  text)
+
+(defun org-lark--preprocess-tables (text st)
+  "Strip quote/callout wrappers in table cells; flatten tables containing grids."
+  (let ((re "<lark-table\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-table>"))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (while (re-search-forward re nil t)
+        (let* ((beg (match-beginning 0))
+               (end (match-end 0))
+               (attrs (match-string 1))
+               (body (match-string 2))
+               (body (replace-regexp-in-string
+                      "</?\\(?:quote-container\\|quote\\|callout\\)[^>]*>"
+                      "" body)))
+          (delete-region beg end)
+          (goto-char beg)
+          (if (string-match-p "<grid[ >]" body)
+              (insert (org-lark--table-to-list attrs body st))
+            (insert (format "<lark-table%s>%s</lark-table>" attrs body)))))
+      (buffer-string))))
+
+(defun org-lark--preprocess-grids (text st)
+  "Flatten grids containing tables to lists."
+  (let ((re "<grid\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</grid>"))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (while (re-search-forward re nil t)
+        (let* ((beg (match-beginning 0))
+               (end (match-end 0))
+               (attrs (match-string 1))
+               (body (match-string 2)))
+          (when (string-match-p "<lark-table[ >]" body)
+            (delete-region beg end)
+            (goto-char beg)
+            (insert (org-lark--grid-to-list attrs body st)))))
+      (buffer-string))))
+
+(defun org-lark--extract-table-rows (body)
+  "Parse table BODY into a list of rows, each a list of cell strings."
+  (let (rows)
+    (with-temp-buffer
+      (insert body)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "<lark-tr\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-tr>" nil t)
+        (let ((row-body (match-string 2)) cells)
+          (with-temp-buffer
+            (insert row-body)
+            (goto-char (point-min))
+            (while (re-search-forward
+                    "<lark-td\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-td>" nil t)
+              (push (string-trim (match-string 2)) cells)))
+          (push (nreverse cells) rows))))
+    (nreverse rows)))
+
+(defun org-lark--table-to-list (attrs body st)
+  "Convert a <lark-table> BODY to an Org list placeholder."
+  (let* ((parsed (org-lark--parse-attrs attrs))
+         (header-p (string= (alist-get "header-row" parsed nil nil #'string=) "true"))
+         (body (org-lark--inline-nested-grid body))
+         (rows (org-lark--extract-table-rows body))
+         (headers (when (and header-p rows) (pop rows)))
+         (lines nil))
+    (dolist (row rows)
+      (if headers
+          (let ((parts nil) (i 0))
+            (dolist (cell row)
+              (let ((h (or (nth i headers) (format "Col %d" (1+ i)))))
+                (push (format "*%s*: %s" h cell) parts))
+              (cl-incf i))
+            (push (concat "- " (string-join (nreverse parts) " | ")) lines))
+        (push (concat "- " (string-join row " | ")) lines)))
+    (org-lark--ph (concat "\n" (string-join (nreverse lines) "\n") "\n") st)))
+
+(defun org-lark--grid-to-list (_attrs body st)
+  "Convert a <grid> BODY containing tables to an Org list placeholder."
+  (let ((columns nil) (col-idx 0))
+    (with-temp-buffer
+      (insert body)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "<column\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</column>" nil t)
+        (cl-incf col-idx)
+        (let* ((col-body (string-trim (match-string 2)))
+               (col-body (org-lark--inline-nested-table col-body)))
+          (push (format "- Column %d\n%s" col-idx
+                        (replace-regexp-in-string "^" "  " col-body))
+                columns))))
+    (org-lark--ph
+     (concat "\n" (string-join (nreverse columns) "\n") "\n") st)))
+
+(defun org-lark--inline-nested-table (text)
+  "Replace <lark-table> blocks in TEXT with simple list items."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (let ((re "<lark-table\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-table>"))
+      (while (re-search-forward re nil t)
+        (let* ((beg (match-beginning 0))
+               (end (match-end 0))
+               (body (match-string 2))
+               (rows (org-lark--extract-table-rows body))
+               (list-text (mapconcat
+                           (lambda (row)
+                             (concat "- " (string-join row " | ")))
+                           rows "\n")))
+          (delete-region beg end)
+          (goto-char beg)
+          (insert list-text))))
+    (buffer-string)))
+
+(defun org-lark--inline-nested-grid (text)
+  "Replace <grid> blocks in TEXT with column content joined by \" / \"."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (let ((re "<grid\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</grid>"))
+      (while (re-search-forward re nil t)
+        (let* ((beg (match-beginning 0))
+               (end (match-end 0))
+               (body (match-string 2))
+               (columns nil))
+          (with-temp-buffer
+            (insert body)
+            (goto-char (point-min))
+            (while (re-search-forward
+                    "<column\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</column>" nil t)
+              (push (string-trim (match-string 2)) columns)))
+          (let ((content (string-join (nreverse columns) " / ")))
+            (delete-region beg end)
+            (goto-char beg)
+            (insert content)))))
+    (buffer-string)))
 
 ;;; Agenda
 
