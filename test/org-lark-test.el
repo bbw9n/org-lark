@@ -67,8 +67,17 @@
   (let ((out (org-lark-test--convert
               "<lark-table rows=\"2\" cols=\"2\" header-row=\"true\">\n<lark-tr><lark-td>A</lark-td><lark-td>B</lark-td></lark-tr>\n<lark-tr><lark-td>x</lark-td><lark-td>y</lark-td></lark-tr>\n</lark-table>")))
     (should (string-match-p "| A | B |" out))
-    (should (string-match-p "|-" out))
+    (should (string-match-p "|---\\+---|" out))
     (should (string-match-p "| x | y |" out))))
+
+(ert-deftest org-lark-test-table-column-alignment ()
+  "Table columns should be padded to equal width."
+  (let ((out (org-lark-test--convert
+              "<lark-table header-row=\"true\">\n<lark-tr><lark-td>Name</lark-td><lark-td>X</lark-td></lark-tr>\n<lark-tr><lark-td>ab</lark-td><lark-td>cd</lark-td></lark-tr>\n</lark-table>")))
+    ;; "ab" should be padded to match "Name" width (4)
+    (should (string-match-p "| ab   | cd |" out))
+    ;; Separator should span full column widths
+    (should (string-match-p "|------\\+----" out))))
 
 (ert-deftest org-lark-test-self-closing-links ()
   (org-lark-test--with-pandoc-stub

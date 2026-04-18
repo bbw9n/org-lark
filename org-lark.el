@@ -328,12 +328,30 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
                            (string-trim (match-string 2)))))
                 (push (replace-regexp-in-string "|" "\\vert{}" cell t t) cells))))
           (push (nreverse cells) rows))))
-    (let ((lines nil) (i 0))
-      (dolist (row (nreverse rows))
+    (let* ((rows (nreverse rows))
+           ;; Compute max width per column for alignment
+           (ncols (apply #'max 0 (mapcar #'length rows)))
+           (widths (make-vector ncols 0))
+           (_ (dolist (row rows)
+                (cl-loop for cell in row for c from 0 do
+                         (aset widths c (max (aref widths c)
+                                             (string-width cell))))))
+           (lines nil) (i 0))
+      (dolist (row rows)
         (cl-incf i)
-        (push (concat "| " (string-join row " | ") " |") lines)
+        (let ((padded
+               (cl-loop for cell in row for c from 0
+                        collect (let ((w (aref widths c)))
+                                  (concat cell
+                                          (make-string (- w (string-width cell))
+                                                       ?\s))))))
+          (push (concat "| " (string-join padded " | ") " |") lines))
         (when (and header (= i 1))
-          (push "|-" lines)))
+          (push (concat "|"
+                        (mapconcat (lambda (w) (make-string (+ w 2) ?-))
+                                   (append widths nil) "+")
+                        "|")
+                lines)))
       (org-lark--ph (concat (string-join (nreverse lines) "\n") "\n") st))))
 
 ;;; Grid + column
