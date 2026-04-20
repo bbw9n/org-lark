@@ -37,3 +37,29 @@ jobs:
           emacs -Q --batch -L . \
             -l test/org-lark-test.el \
             -f ert-run-tests-batch-and-exit
+
+  melpazoid:
+    name: melpazoid
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox
+          emacs --version
+          git clone https://github.com/riscy/melpazoid.git ~/melpazoid
+
+      - name: Run melpazoid
+        env:
+          LOCAL_REPO: ${{ github.workspace }}
+          RECIPE: (org-lark :fetcher github :repo "bbw9n/org-lark")
+          EXIST_OK: false
+        run: make -C ~/melpazoid
