@@ -1,12 +1,29 @@
 ;;; org-lark.el --- Export Lark docs to Org -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2026
+;; Copyright (C) 2026  bbw9n
 
 ;; Author: bbw9n <bbw9nio@gmail.com>
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: outlines, hypermedia, tools
 ;; URL: https://github.com/bbw9n/org-lark
+
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is NOT part of GNU Emacs.
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -78,7 +95,7 @@ Toggle interactively with `org-lark-toggle-debug'."
 (defconst org-lark--log-buffer-name "*org-lark-log*")
 
 (defun org-lark--log (fmt &rest args)
-  "Append a timestamped line to the *org-lark-log* buffer.
+  "Append a timestamped line built from FMT and ARGS to the log buffer.
 Only active when `org-lark-debug' is non-nil."
   (when org-lark-debug
     (let ((line (apply #'format (concat "[%s] " fmt "\n")
@@ -86,12 +103,12 @@ Only active when `org-lark-debug' is non-nil."
           (buf (get-buffer-create org-lark--log-buffer-name)))
       (with-current-buffer buf
         (let ((inhibit-read-only t)
-              (at-end (= (point) (point-max))))
+              (at-end (eobp)))
           (save-excursion
             (goto-char (point-max))
             (insert line))
           (when at-end (goto-char (point-max))))
-        (unless (eq major-mode 'special-mode)
+        (unless (derived-mode-p 'special-mode)
           (special-mode))))))
 
 ;;;###autoload
@@ -191,7 +208,8 @@ Return alist with keys `markdown', `title', `doc_id'."
 
 (defun org-lark--pipeline (markdown fetched source st)
   "Full pipeline: Lark MARKDOWN to finished Org string.
-FETCHED holds metadata, SOURCE is the original URL/token."
+FETCHED holds metadata, SOURCE is the original URL/token.
+ST is the mutable export state."
   (let ((t0 (float-time)))
     (org-lark--log "pipeline: %d chars input" (length markdown))
     (let* ((text (org-lark--protect-code-blocks markdown st))
@@ -215,7 +233,7 @@ FETCHED holds metadata, SOURCE is the original URL/token."
 ;;;; Code-block protection ─────────────────────────────────────────
 
 (defun org-lark--protect-code-blocks (text st)
-  "Replace fenced code blocks in TEXT with placeholders."
+  "Replace fenced code blocks in TEXT with placeholders in ST."
   (org-lark--re-replace
    text "```\\([^\n]*\\)\n\\(\\(?:.\\|\n\\)*?\\)\n```[ \t]*"
    (lambda ()
@@ -232,7 +250,8 @@ FETCHED holds metadata, SOURCE is the original URL/token."
 ;;;; Tag normalization ─────────────────────────────────────────────
 
 (defun org-lark--normalize-tags (text st)
-  "Replace all Lark custom tags in TEXT with placeholders or Markdown."
+  "Replace all Lark custom tags in TEXT with placeholders or Markdown.
+ST is the mutable export state."
   (setq text (org-lark--flatten-nested text st))
   (dolist (tag '("equation" "quote-container" "quote" "callout"
                  "lark-table" "grid" "agenda" "source-synced"
@@ -256,7 +275,8 @@ FETCHED holds metadata, SOURCE is the original URL/token."
   text)
 
 (defun org-lark--dispatch-paired (tag attrs body st)
-  "Route paired TAG to the right handler."
+  "Route paired TAG with ATTRS and BODY to the right handler.
+ST is the mutable export state."
   (pcase tag
     ("equation"
      (org-lark--ph (concat "\n\\[\n" (string-trim body) "\n\\]\n") st))
@@ -298,6 +318,7 @@ FETCHED holds metadata, SOURCE is the original URL/token."
 
 (defun org-lark--wrap-block (attrs body st block-name)
   "Wrap BODY in #+begin_BLOCK-NAME / #+end_BLOCK-NAME.
+ATTRS are forwarded as #+attr_org.  ST holds placeholders.
 Org markers become placeholders; inner Markdown stays for Pandoc."
   (let ((inner (org-lark--normalize-tags body st))
         (attr  (org-lark--attr-line attrs)))
@@ -308,7 +329,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;; Table
 
 (defun org-lark--tag-table (attrs body st)
-  "Convert <lark-table> to an Org table placeholder."
+  "Convert <lark-table> with ATTRS and BODY to an Org table placeholder in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (header (string= (alist-get "header-row" parsed nil nil #'string=) "true"))
          (rows nil))
@@ -357,7 +378,8 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;; Grid + column
 
 (defun org-lark--tag-grid (attrs body st)
-  "Convert <grid> with inner <column> tags."
+  "Convert <grid> with ATTRS and BODY containing inner <column> tags.
+ST is the mutable export state."
   (let ((inner (org-lark--replace-paired
                 body "column"
                 (lambda (col-attrs col-body)
@@ -371,13 +393,15 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;; Nesting pre-pass (quote-in-table, grid-in-table, table-in-grid)
 
 (defun org-lark--flatten-nested (text st)
-  "Pre-pass: strip quotes in tables, flatten nested table/grid to lists."
+  "Pre-pass: strip quotes in tables, flatten nested table/grid in TEXT to lists.
+ST is the mutable export state."
   (setq text (org-lark--preprocess-tables text st))
   (setq text (org-lark--preprocess-grids text st))
   text)
 
 (defun org-lark--preprocess-tables (text st)
-  "Strip quote/callout wrappers in table cells; flatten tables containing grids."
+  "Strip quote/callout wrappers in table cells of TEXT; flatten tables with grids.
+ST is the mutable export state."
   (let ((re "<lark-table\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-table>"))
     (with-temp-buffer
       (insert text)
@@ -398,7 +422,8 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
       (buffer-string))))
 
 (defun org-lark--preprocess-grids (text st)
-  "Flatten grids containing tables to lists."
+  "Flatten grids containing tables in TEXT to lists.
+ST is the mutable export state."
   (let ((re "<grid\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</grid>"))
     (with-temp-buffer
       (insert text)
@@ -433,7 +458,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
     (nreverse rows)))
 
 (defun org-lark--table-to-list (attrs body st)
-  "Convert a <lark-table> BODY to an Org list placeholder."
+  "Convert a <lark-table> with ATTRS and BODY to an Org list placeholder in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (header-p (string= (alist-get "header-row" parsed nil nil #'string=) "true"))
          (body (org-lark--inline-nested-grid body))
@@ -452,7 +477,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
     (org-lark--ph (concat "\n" (string-join (nreverse lines) "\n") "\n") st)))
 
 (defun org-lark--grid-to-list (_attrs body st)
-  "Convert a <grid> BODY containing tables to an Org list placeholder."
+  "Convert a <grid> with BODY containing tables to an Org list placeholder in ST."
   (let ((columns nil) (col-idx 0))
     (with-temp-buffer
       (insert body)
@@ -514,7 +539,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;; Agenda
 
 (defun org-lark--tag-agenda (_attrs body st)
-  "Convert <agenda> to Org heading tree."
+  "Convert <agenda> BODY to Org heading tree placeholder in ST."
   (let (items)
     (with-temp-buffer
       (insert body)
@@ -534,7 +559,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;; OKR
 
 (defun org-lark--tag-okr (attrs body st)
-  "Convert <okr> to Org heading tree."
+  "Convert <okr> with ATTRS and BODY to Org heading tree in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (period (or (alist-get "period-name-zh" parsed nil nil #'string=)
                      (alist-get "period-name-en" parsed nil nil #'string=)
@@ -558,7 +583,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 ;;;; Self-closing tags ─────────────────────────────────────────────
 
 (defun org-lark--replace-self-closing (text st)
-  "Replace <tag .../> self-closing tags in TEXT."
+  "Replace <tag .../> self-closing tags in TEXT using ST for placeholders."
   (org-lark--re-replace
    text "<\\([A-Za-z][A-Za-z0-9-]*\\)\\([^>\n]*\\)/>"
    (lambda ()
@@ -569,7 +594,8 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
        (or result full)))))
 
 (defun org-lark--dispatch-self-closing (tag attrs st)
-  "Handle a self-closing TAG.  Return replacement or nil to keep original."
+  "Handle a self-closing TAG with ATTRS.  Return replacement or nil.
+ST is the mutable export state."
   (pcase tag
     ("image"        (org-lark--sc-media attrs nil st))
     ("whiteboard"   (org-lark--sc-media attrs "whiteboard" st))
@@ -603,7 +629,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
     (_ nil)))
 
 (defun org-lark--sc-media (attrs type st)
-  "Handle <image/> and <whiteboard/> tags."
+  "Handle <image/> and <whiteboard/> tags with ATTRS and TYPE in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (token  (alist-get "token" parsed nil nil #'string=))
          (path   (org-lark--download-media token type st)))
@@ -616,7 +642,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
      st)))
 
 (defun org-lark--sc-file (attrs st)
-  "Handle <file/> tag."
+  "Handle <file/> tag with ATTRS, storing placeholder in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (token  (alist-get "token" parsed nil nil #'string=))
          (name   (or (alist-get "name" parsed nil nil #'string=) "Lark file"))
@@ -628,7 +654,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
      st)))
 
 (defun org-lark--sc-mention-user (attrs st)
-  "Handle <mention-user/> tag."
+  "Handle <mention-user/> tag with ATTRS, storing placeholder in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (id     (alist-get "id" parsed nil nil #'string=))
          (short  (and id (substring id 0 (min 10 (length id))))))
@@ -650,7 +676,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
       n)))
 
 (defun org-lark--download-media (token type st)
-  "Download media TOKEN of TYPE.  Return local path or nil."
+  "Download media TOKEN of TYPE using ST for paths.  Return local path or nil."
   (when (and org-lark-download-media token)
     (cl-incf (org-lark--state-media-done st))
     (let ((total (org-lark--state-media-total st))
@@ -700,7 +726,7 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
     key))
 
 (defun org-lark--restore-placeholders (text st)
-  "Replace every placeholder in TEXT with its stored value."
+  "Replace every placeholder in TEXT with its stored value from ST."
   (let ((result text))
     (dolist (entry (org-lark--state-placeholders st) result)
       (setq result (replace-regexp-in-string
@@ -742,7 +768,7 @@ FUNC is called with (ATTRS BODY) strings."
 ;;;; Subprocess helpers ────────────────────────────────────────────
 
 (defun org-lark--msg (fmt &rest args)
-  "Show a status message in the minibuffer and force a redisplay."
+  "Show a status message built from FMT and ARGS in the minibuffer."
   (apply #'message (concat "org-lark: " fmt) args)
   (redisplay t))
 
@@ -804,7 +830,7 @@ Uses `make-process' with a deadline so Emacs stays responsive."
 ;;;; Post-processing ───────────────────────────────────────────────
 
 (defun org-lark--fix-deep-headings (text)
-  "Convert Markdown-style ####### headings beyond level 6 to Org stars."
+  "Convert deep Markdown headings in TEXT beyond level 6 to Org stars."
   (org-lark--re-replace
    text "^\\(?:\u200b\\)?\\(#\\{7,\\}\\)[ \t]+\\(.+\\)$"
    (lambda ()
