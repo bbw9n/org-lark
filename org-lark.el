@@ -128,16 +128,90 @@ Only active when `org-lark-debug' is non-nil."
 (cl-defstruct org-lark--state
   "Mutable bag threaded through a single export."
   output-file asset-dir (placeholders nil) (counter 0)
-  (media-done 0) (media-total 0))
+  (media-done 0) (media-total 0)
+  ;; Deferred media downloads — populated by sc-media/sc-file when
+  ;; `org-lark--defer-media' is non-nil.  Each entry is
+  ;; (KEY . PLIST) where PLIST has :kind :token :type :attrs :name.
+  ;; Resolved post-pandoc by the async export driver.
+  (media-jobs nil))
 
 (defconst org-lark--ph-prefix "ORGLARKPH"
   "Placeholder token prefix.  Unlikely to collide with document text.")
 
+(defvar org-lark--defer-media nil
+  "When non-nil, sc-media and sc-file queue downloads instead of running them.
+The async export driver binds this so media downloads can be
+fanned out in parallel after the sync parse phase completes.")
+
 ;;;; User commands ──────────────────────────────────────────────────
 
 ;;;###autoload
-(defun org-lark-export (doc output-file)
-  "Export Lark DOC (URL or document token) to OUTPUT-FILE in Org format."
+(defun org-lark-export-async (doc output-file callback)
+  "Export Lark DOC to OUTPUT-FILE asynchronously.
+Returns nil immediately.  CALLBACK is invoked with (ERR PATH) on
+completion: ERR is nil and PATH is the absolute output file path
+on success; on failure ERR is a descriptive string and PATH is nil.
+The whole pipeline (fetch, pandoc, media downloads) runs through
+async subprocesses so Emacs stays interactive throughout."
+  (when (and (file-exists-p output-file)
+             (not org-lark-overwrite))
+    (user-error "Refusing to overwrite %s" output-file))
+  (org-lark--log "export doc=%s → %s" doc output-file)
+  (org-lark--msg "fetching...")
+  (let* ((output-file (expand-file-name output-file))
+         (st (make-org-lark--state
+              :output-file output-file
+              :asset-dir (expand-file-name
+                          org-lark-assets-directory
+                          (file-name-directory output-file)))))
+    (org-lark-fetch-async
+     doc
+     (lambda (err fetched)
+       (cond
+        (err
+         (org-lark--msg "fetch failed: %s" err)
+         (funcall callback err nil))
+        (t
+         (org-lark--log "fetched \"%s\" (%d chars)"
+                        (alist-get 'title fetched)
+                        (length (alist-get 'markdown fetched)))
+         (org-lark--msg "converting...")
+         (org-lark--pipeline-async
+          (alist-get 'markdown fetched) fetched doc st
+          (lambda (err org-text)
+            (cond
+             (err
+              (org-lark--msg "convert failed: %s" err)
+              (funcall callback err nil))
+             (t
+              (condition-case write-err
+                  (progn
+                    (make-directory (file-name-directory output-file) t)
+                    (with-temp-file output-file (insert org-text))
+                    (org-lark--log "wrote %s (%d chars)"
+                                   output-file (length org-text))
+                    (org-lark--msg "done → %s"
+                                   (file-name-nondirectory output-file))
+                    (funcall callback nil output-file))
+                (error
+                 (let ((msg (error-message-string write-err)))
+                   (org-lark--log "write failed: %s" msg)
+                   (funcall callback msg nil))))))))))))
+    nil))
+
+;;;###autoload
+(defun org-lark-export (doc output-file &optional callback)
+  "Export Lark DOC (URL or document token) to OUTPUT-FILE in Org format.
+
+When called interactively or with a CALLBACK argument, runs
+asynchronously and returns nil immediately; the buffer stays
+responsive during fetch, conversion and media downloads.  In the
+interactive case, the file is opened on completion when
+`org-lark-open-after-export' is non-nil.
+
+When called programmatically without CALLBACK, blocks until the
+export finishes and returns the absolute output path (matching
+the pre-async API)."
   (interactive
    (let* ((doc (read-string "Lark doc URL or token: "))
           (default (concat default-directory "lark-export.org"))
@@ -146,37 +220,32 @@ Only active when `org-lark-debug' is non-nil."
      (list doc out)))
   (when (and (file-exists-p output-file)
              (not org-lark-overwrite)
-             (if (called-interactively-p 'interactive)
-                 (not (y-or-n-p (format "Overwrite %s? " output-file)))
-               t))
+             (called-interactively-p 'interactive)
+             (not (y-or-n-p (format "Overwrite %s? " output-file))))
     (user-error "Refusing to overwrite %s" output-file))
-  (org-lark--log "export doc=%s → %s" doc output-file)
-  (org-lark--msg "fetching...")
-  (let* ((fetched (org-lark-fetch doc))
-         (st (make-org-lark--state
-              :output-file (expand-file-name output-file)
-              :asset-dir (expand-file-name
-                          org-lark-assets-directory
-                          (file-name-directory
-                           (expand-file-name output-file))))))
-    (org-lark--log "fetched \"%s\" (%d chars)"
-                   (alist-get 'title fetched)
-                   (length (alist-get 'markdown fetched)))
-    (when org-lark-download-media
-      (setf (org-lark--state-media-total st)
-            (org-lark--count-media (alist-get 'markdown fetched))))
-    (org-lark--msg "converting...")
-    (let ((org (org-lark--pipeline (alist-get 'markdown fetched)
-                                   fetched doc st)))
-      (make-directory (file-name-directory (expand-file-name output-file)) t)
-      (let ((output-file (expand-file-name output-file)))
-        (with-temp-file output-file (insert org))
-        (org-lark--log "wrote %s (%d chars)" output-file (length org))
-        (when (and org-lark-open-after-export
-                   (called-interactively-p 'interactive))
-          (find-file output-file))
-        (org-lark--msg "done → %s" (file-name-nondirectory output-file))
-        output-file))))
+  (cond
+   ;; Programmatic + callback supplied: fire-and-forget.
+   (callback
+    (org-lark-export-async doc output-file callback))
+   ;; Interactive: async, status via message, optional auto-open.
+   ((called-interactively-p 'interactive)
+    (org-lark-export-async
+     doc output-file
+     (lambda (err path)
+       (cond
+        (err (message "org-lark: export failed: %s" err))
+        (t (when org-lark-open-after-export
+             (find-file path)))))))
+   ;; Programmatic, no callback: block until done so existing
+   ;; sync callers still receive the output path.
+   (t
+    (let ((done nil) (err nil) (result nil))
+      (org-lark-export-async
+       doc output-file
+       (lambda (e p) (setq done t err e result p)))
+      (while (not done) (accept-process-output nil 0.05))
+      (when err (user-error "org-lark: %s" err))
+      result))))
 
 ;;;###autoload
 (defun org-lark-export-url-at-point (output-file)
@@ -229,6 +298,49 @@ ST is the mutable export state."
               "#+lark_source: " source "\n"
               "#+created_by: org-lark\n\n"
               org "\n"))))
+
+(defun org-lark--metadata-header (fetched source)
+  "Build the #+title / #+lark_* preamble for FETCHED and SOURCE."
+  (concat "#+title: " (or (alist-get 'title fetched) "Lark export") "\n"
+          (let ((id (alist-get 'doc_id fetched)))
+            (if id (format "#+lark_doc_id: %s\n" id) ""))
+          "#+lark_source: " source "\n"
+          "#+created_by: org-lark\n\n"))
+
+(defun org-lark--pipeline-async (markdown fetched source st callback)
+  "Async variant of `org-lark--pipeline'.
+Defers media downloads (via the dynamic `org-lark--defer-media'
+binding), runs pandoc and media downloads asynchronously, and
+calls CALLBACK with (ERR ORG-STRING)."
+  (let ((t0 (float-time)))
+    (org-lark--log "pipeline-async: %d chars input" (length markdown))
+    (let* ((org-lark--defer-media t)
+           (text (org-lark--protect-code-blocks markdown st))
+           (text (org-lark--normalize-tags text st)))
+      (org-lark--log "  parse → %d placeholders, %d media jobs"
+                     (org-lark--state-counter st)
+                     (length (org-lark--state-media-jobs st)))
+      (org-lark--pandoc-async
+       text
+       (lambda (err org-text)
+         (cond
+          (err (funcall callback err nil))
+          (t
+           (let* ((org-text (org-lark--restore-placeholders org-text st))
+                  (org-text (org-lark--fix-deep-headings org-text)))
+             (org-lark--download-all-media-async
+              st
+              (lambda (results)
+                (let* ((final (org-lark--substitute-media-results
+                               org-text st results))
+                       (final (replace-regexp-in-string
+                               "\n\\{3,\\}" "\n\n" (string-trim final))))
+                  (org-lark--log "pipeline-async: %.2fs total"
+                                 (- (float-time) t0))
+                  (funcall callback nil
+                           (concat (org-lark--metadata-header fetched source)
+                                   final "\n"))))))))))
+      nil)))
 
 ;;;; Code-block protection ─────────────────────────────────────────
 
@@ -629,29 +741,43 @@ ST is the mutable export state."
     (_ nil)))
 
 (defun org-lark--sc-media (attrs type st)
-  "Handle <image/> and <whiteboard/> tags with ATTRS and TYPE in ST."
+  "Handle <image/> and <whiteboard/> tags with ATTRS and TYPE in ST.
+When `org-lark--defer-media' is non-nil and downloads are enabled,
+queues the download into ST.media-jobs and returns a deferred
+placeholder; the async driver substitutes it after fan-out."
   (let* ((parsed (org-lark--parse-attrs attrs))
-         (token  (alist-get "token" parsed nil nil #'string=))
-         (path   (org-lark--download-media token type st)))
-    (org-lark--ph
-     (concat (org-lark--attr-line attrs)
-             (if path
-                 (format "[[file:%s]]\n" (org-lark--relative-path path st))
-               (format "# Lark %s token: %s\n"
-                       (or type "image") (or token ""))))
-     st)))
+         (token  (alist-get "token" parsed nil nil #'string=)))
+    (cond
+     ((and org-lark--defer-media org-lark-download-media token)
+      (org-lark--ph-media
+       (if (string= type "whiteboard") 'whiteboard 'image)
+       token type attrs nil st))
+     (t
+      (let ((path (org-lark--download-media token type st)))
+        (org-lark--ph
+         (concat (org-lark--attr-line attrs)
+                 (if path
+                     (format "[[file:%s]]\n" (org-lark--relative-path path st))
+                   (format "# Lark %s token: %s\n"
+                           (or type "image") (or token ""))))
+         st))))))
 
 (defun org-lark--sc-file (attrs st)
-  "Handle <file/> tag with ATTRS, storing placeholder in ST."
+  "Handle <file/> tag with ATTRS, storing placeholder in ST.
+Honours `org-lark--defer-media' the same way as `org-lark--sc-media'."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (token  (alist-get "token" parsed nil nil #'string=))
-         (name   (or (alist-get "name" parsed nil nil #'string=) "Lark file"))
-         (path   (org-lark--download-media token nil st)))
-    (org-lark--ph
-     (if path
-         (format "[[file:%s][%s]]\n" (org-lark--relative-path path st) name)
-       (format "# Lark file token: %s name: %s\n" (or token "") name))
-     st)))
+         (name   (or (alist-get "name" parsed nil nil #'string=) "Lark file")))
+    (cond
+     ((and org-lark--defer-media org-lark-download-media token)
+      (org-lark--ph-media 'file token nil attrs name st))
+     (t
+      (let ((path (org-lark--download-media token nil st)))
+        (org-lark--ph
+         (if path
+             (format "[[file:%s][%s]]\n" (org-lark--relative-path path st) name)
+           (format "# Lark file token: %s name: %s\n" (or token "") name))
+         st))))))
 
 (defun org-lark--sc-mention-user (attrs st)
   "Handle <mention-user/> tag with ATTRS, storing placeholder in ST."
@@ -725,6 +851,20 @@ ST is the mutable export state."
     (push (cons key value) (org-lark--state-placeholders st))
     key))
 
+(defun org-lark--ph-media (kind token type attrs name st)
+  "Allocate a deferred-media placeholder in ST.
+KIND is `image', `whiteboard', or `file'.  TOKEN/TYPE are forwarded
+to lark-cli +media-download.  ATTRS is the original tag attrs string
+(used to render #+attr_org on success).  NAME is the display label
+for file links.  Returns a placeholder key string."
+  (let ((key (format "%s%d_"
+                     org-lark--ph-prefix
+                     (cl-incf (org-lark--state-counter st)))))
+    (push (cons key (list :kind kind :token token :type type
+                          :attrs attrs :name name))
+          (org-lark--state-media-jobs st))
+    key))
+
 (defun org-lark--restore-placeholders (text st)
   "Replace every placeholder in TEXT with its stored value from ST."
   (let ((result text))
@@ -733,6 +873,46 @@ ST is the mutable export state."
                     (regexp-quote (car entry))
                     (lambda (_) (cdr entry))
                     result t t)))))
+
+(defun org-lark--media-replacement (job err path st)
+  "Compute the inline replacement string for a media JOB.
+ERR is non-nil if the download failed; PATH is the local file path
+on success.  ST is the export state, used for relative-path resolution."
+  (let ((kind (plist-get job :kind))
+        (token (plist-get job :token))
+        (type (plist-get job :type))
+        (attrs (plist-get job :attrs))
+        (name (plist-get job :name)))
+    (cond
+     ((and (not err) path)
+      (let ((rel (org-lark--relative-path path st))
+            (attr-line (org-lark--attr-line attrs)))
+        (pcase kind
+          ('file (format "[[file:%s][%s]]\n" rel name))
+          (_     (format "%s[[file:%s]]\n" attr-line rel)))))
+     (t
+      (pcase kind
+        ('file (format "# Lark file token: %s name: %s\n"
+                       (or token "") name))
+        (_     (format "%s# Lark %s token: %s\n"
+                       (org-lark--attr-line attrs)
+                       (or type "image") (or token ""))))))))
+
+(defun org-lark--substitute-media-results (text st results)
+  "Replace media placeholders in TEXT using RESULTS for ST.
+RESULTS is an alist of (KEY . (ERR . PATH))."
+  (let ((result text))
+    (dolist (entry (org-lark--state-media-jobs st) result)
+      (let* ((key (car entry))
+             (job (cdr entry))
+             (download (cdr (assoc key results)))
+             (err (car-safe download))
+             (path (cdr-safe download))
+             (replacement (org-lark--media-replacement job err path st)))
+        (setq result (replace-regexp-in-string
+                      (regexp-quote key)
+                      (lambda (_) replacement)
+                      result t t))))))
 
 ;;;; Regex replace helper ──────────────────────────────────────────
 
@@ -826,6 +1006,187 @@ Uses `make-process' with a deadline so Emacs stays responsive."
           (org-lark--run org-lark-pandoc-program
                          "-f" "gfm" "-t" "org" "--wrap=none" in-file))
       (delete-file in-file t))))
+
+;;;; Async subprocess helpers ──────────────────────────────────────
+
+(defun org-lark--run-async (program args callback)
+  "Run PROGRAM with ARGS asynchronously.
+Call CALLBACK with (ERR STDOUT) when the process exits.  ERR is
+nil on success or a string describing the failure (timeout,
+non-zero exit, etc.)."
+  (let* ((bin (file-name-nondirectory program))
+         (cmd (format "%s %s" bin
+                      (mapconcat #'shell-quote-argument args " ")))
+         (stdout-buf (generate-new-buffer " *org-lark*"))
+         (stderr-buf (generate-new-buffer " *org-lark-err*"))
+         (t0 (float-time))
+         (timer nil)
+         (proc nil))
+    (org-lark--log "$ %s" cmd)
+    (setq proc
+          (make-process
+           :name "org-lark-async"
+           :buffer stdout-buf
+           :stderr stderr-buf
+           :command (cons program args)
+           :connection-type 'pipe
+           :noquery t
+           :sentinel
+           (lambda (p _event)
+             (when (memq (process-status p) '(exit signal))
+               (when timer (cancel-timer timer))
+               (let* ((exit-code (process-exit-status p))
+                      (out-len (with-current-buffer stdout-buf (buffer-size)))
+                      (elapsed (- (float-time) t0)))
+                 (org-lark--log "  → %.1fs, exit %d, %d bytes"
+                                elapsed exit-code out-len)
+                 (unwind-protect
+                     (cond
+                      ((zerop exit-code)
+                       (let ((stdout (with-current-buffer stdout-buf
+                                       (buffer-string))))
+                         (funcall callback nil stdout)))
+                      (t
+                       (let ((err (with-current-buffer stderr-buf
+                                    (string-trim (buffer-string)))))
+                         (org-lark--log "  FAILED: %s" err)
+                         (funcall callback
+                                  (format "%s failed (exit %d): %s"
+                                          bin exit-code err)
+                                  nil))))
+                   (ignore-errors (kill-buffer stdout-buf))
+                   (ignore-errors (kill-buffer stderr-buf))))))))
+    ;; Deadline: a non-blocking timer kills the process if it hangs.
+    (setq timer
+          (run-at-time
+           org-lark-timeout nil
+           (lambda ()
+             (when (process-live-p proc)
+               (org-lark--log "TIMEOUT %ds: %s" org-lark-timeout cmd)
+               (delete-process proc)))))
+    proc))
+
+(defun org-lark--run-json-async (program args callback)
+  "Run PROGRAM with ARGS, parse stdout as JSON, call CALLBACK with (ERR JSON)."
+  (org-lark--run-async
+   program args
+   (lambda (err stdout)
+     (cond
+      (err (funcall callback err nil))
+      (t (condition-case parse-err
+             (funcall callback nil
+                      (json-parse-string stdout
+                                         :object-type 'alist
+                                         :array-type 'list))
+           (error
+            (funcall callback
+                     (format "JSON parse failed: %s"
+                             (error-message-string parse-err))
+                     nil))))))))
+
+(defun org-lark--pandoc-async (markdown callback)
+  "Async variant of `org-lark--pandoc'.
+Call CALLBACK with (ERR ORG)."
+  (org-lark--msg "running pandoc...")
+  (let ((in-file (make-temp-file "org-lark-" nil ".md")))
+    (with-temp-file in-file (insert markdown))
+    (org-lark--run-async
+     org-lark-pandoc-program
+     (list "-f" "gfm" "-t" "org" "--wrap=none" in-file)
+     (lambda (err out)
+       (ignore-errors (delete-file in-file t))
+       (funcall callback err out)))))
+
+(defun org-lark-fetch-async (doc callback)
+  "Async variant of `org-lark-fetch'.
+Call CALLBACK with (ERR FETCHED-ALIST)."
+  (org-lark--run-json-async
+   org-lark-cli-program
+   (list "docs" "+fetch" "--as" org-lark-identity
+         "--doc" doc "--format" "json")
+   (lambda (err json)
+     (cond
+      (err (funcall callback err nil))
+      ((not (alist-get 'ok json))
+       (funcall callback
+                (format "lark-cli: %s"
+                        (json-encode (or (alist-get 'error json) json)))
+                nil))
+      (t (let ((data (alist-get 'data json)))
+           (funcall callback nil
+                    `((markdown . ,(or (alist-get 'markdown data) ""))
+                      (title    . ,(alist-get 'title data))
+                      (doc_id   . ,(alist-get 'doc_id data))))))))))
+
+(defun org-lark--download-media-async (token type st callback)
+  "Async variant of `org-lark--download-media'.
+Call CALLBACK with (ERR PATH).  PATH is nil on failure."
+  (cond
+   ((not (and org-lark-download-media token))
+    (funcall callback nil nil))
+   (t
+    (make-directory (org-lark--state-asset-dir st) t)
+    (let* ((output-dir (file-name-directory
+                        (org-lark--state-output-file st)))
+           (relative-output
+            (file-name-as-directory
+             (file-relative-name (org-lark--state-asset-dir st)
+                                 output-dir)))
+           (base-name (concat (org-lark--safe-filename token)
+                              (when (string= type "whiteboard") "-wb")))
+           (base (concat relative-output base-name))
+           (args (append (list "docs" "+media-download"
+                               "--as" org-lark-identity
+                               "--token" token "--output" base)
+                         (when type (list "--type" type))))
+           (default-directory output-dir))
+      (org-lark--log "media token=%s type=%s" token (or type "auto"))
+      (org-lark--run-json-async
+       org-lark-cli-program args
+       (lambda (err json)
+         (cond
+          (err (org-lark--log "media FAILED: %s" err)
+               (funcall callback err nil))
+          ((not (alist-get 'ok json))
+           (org-lark--log "media error token=%s" token)
+           (funcall callback "media-download API error" nil))
+          (t (let* ((data (alist-get 'data json))
+                    (path (or (alist-get 'saved_path data)
+                              (alist-get 'output data) base))
+                    (path (if (file-name-absolute-p path)
+                              path
+                            (expand-file-name path output-dir))))
+               (org-lark--log "  saved → %s" path)
+               (funcall callback nil path))))))))))
+
+(defun org-lark--download-all-media-async (st done-callback)
+  "Run every queued media job in ST in parallel.
+Call DONE-CALLBACK with the results alist when all jobs finish."
+  (let* ((jobs (org-lark--state-media-jobs st))
+         (n (length jobs))
+         (remaining n)
+         (results nil))
+    (setf (org-lark--state-media-total st) n
+          (org-lark--state-media-done st) 0)
+    (cond
+     ((zerop n) (funcall done-callback nil))
+     (t
+      (org-lark--msg "downloading %d media item(s)..." n)
+      (dolist (entry jobs)
+        (let ((key (car entry))
+              (token (plist-get (cdr entry) :token))
+              (type (plist-get (cdr entry) :type)))
+          (org-lark--download-media-async
+           token type st
+           (lambda (err path)
+             (push (cons key (cons err path)) results)
+             (cl-incf (org-lark--state-media-done st))
+             (cl-decf remaining)
+             (let ((total (org-lark--state-media-total st))
+                   (done (org-lark--state-media-done st)))
+               (org-lark--msg "downloading media %d/%d..." done total))
+             (when (zerop remaining)
+               (funcall done-callback results))))))))))
 
 ;;;; Post-processing ───────────────────────────────────────────────
 

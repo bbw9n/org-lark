@@ -7,18 +7,24 @@
 ;;; Helpers ────────────────────────────────────────────────────────
 
 (defmacro org-lark-test--with-pandoc-stub (&rest body)
-  "Run BODY with a lightweight Pandoc stub (no subprocess)."
+  "Run BODY with a lightweight Pandoc stub (no subprocess).
+Stubs both the sync `org-lark--pandoc' and the async
+`org-lark--pandoc-async' so tests covering either flavour run
+without spawning a real Pandoc process."
   (declare (indent 0))
-  `(cl-letf (((symbol-function 'org-lark--pandoc)
-              (lambda (markdown)
-                (let ((text markdown))
-                  (setq text (replace-regexp-in-string
-                              "^# \\(.+\\)$" "* \\1" text))
-                  (setq text (replace-regexp-in-string
-                              "^## \\(.+\\)$" "** \\1" text))
-                  (setq text (replace-regexp-in-string
-                              "\\*\\*\\([^*]+\\)\\*\\*" "*\\1*" text))
-                  text))))
+  `(cl-letf* ((stub-fn (lambda (markdown)
+                         (let ((text markdown))
+                           (setq text (replace-regexp-in-string
+                                       "^# \\(.+\\)$" "* \\1" text))
+                           (setq text (replace-regexp-in-string
+                                       "^## \\(.+\\)$" "** \\1" text))
+                           (setq text (replace-regexp-in-string
+                                       "\\*\\*\\([^*]+\\)\\*\\*" "*\\1*" text))
+                           text)))
+              ((symbol-function 'org-lark--pandoc) stub-fn)
+              ((symbol-function 'org-lark--pandoc-async)
+               (lambda (markdown cb)
+                 (funcall cb nil (funcall stub-fn markdown)))))
      ,@body))
 
 (defun org-lark-test--st ()
@@ -121,11 +127,12 @@
                                   temporary-file-directory)))
     (unwind-protect
         (org-lark-test--with-pandoc-stub
-          (cl-letf (((symbol-function 'org-lark-fetch)
-                     (lambda (_doc)
-                       '((markdown . "# Hello")
-                         (title . "My Doc")
-                         (doc_id . "doc1"))))
+          (cl-letf (((symbol-function 'org-lark-fetch-async)
+                     (lambda (_doc cb)
+                       (funcall cb nil
+                                '((markdown . "# Hello")
+                                  (title . "My Doc")
+                                  (doc_id . "doc1")))))
                     ((symbol-function 'find-file)
                      (lambda (&rest _args)
                        (setq opened t))))
@@ -250,6 +257,116 @@
     (should-not (string-match-p "begin_lark_grid" out))
     (should (string-match-p "A" out))
     (should (string-match-p "B" out))))
+
+(ert-deftest org-lark-test-async-defers-media-jobs ()
+  "When `org-lark--defer-media' is bound, sc-media queues jobs
+into ST.media-jobs instead of downloading."
+  (let ((download-called 0))
+    (cl-letf (((symbol-function 'org-lark--download-media)
+               (lambda (&rest _) (cl-incf download-called) nil)))
+      (let* ((st (org-lark-test--st))
+             (org-lark-download-media t)
+             (org-lark--defer-media t))
+        (org-lark--normalize-tags
+         "<image token=\"a\"/>\n<file token=\"b\" name=\"doc.pdf\"/>"
+         st)
+        (should (= download-called 0))
+        (should (= (length (org-lark--state-media-jobs st)) 2))
+        ;; Kinds recorded
+        (let ((kinds (mapcar (lambda (e) (plist-get (cdr e) :kind))
+                             (org-lark--state-media-jobs st))))
+          (should (member 'image kinds))
+          (should (member 'file kinds)))))))
+
+(ert-deftest org-lark-test-async-pipeline-substitutes-media ()
+  "Async pipeline emits placeholders during parse, downloads media
+in parallel, and substitutes resolved paths into the final org."
+  (let ((download-args nil)
+        (output (expand-file-name "org-lark-async-test.org"
+                                  temporary-file-directory)))
+    (unwind-protect
+        (org-lark-test--with-pandoc-stub
+          (cl-letf (((symbol-function 'org-lark-fetch-async)
+                     (lambda (_doc cb)
+                       (funcall cb nil
+                                '((markdown . "<image token=\"img1\" width=\"640\"/>")
+                                  (title . "T") (doc_id . "d1")))))
+                    ((symbol-function 'org-lark--download-media-async)
+                     (lambda (token type st cb)
+                       (push (list :token token :type type) download-args)
+                       (funcall cb nil
+                                (expand-file-name
+                                 (concat token ".png")
+                                 (org-lark--state-asset-dir st))))))
+            (let ((org-lark-overwrite t)
+                  (org-lark-download-media t)
+                  (org-lark-open-after-export nil))
+              (should (equal (org-lark-export "doc" output) output))
+              ;; Async path was used: download-media-async invoked once.
+              (should (= (length download-args) 1))
+              (should (equal (plist-get (car download-args) :token) "img1"))
+              ;; Final org contains the substituted file link.
+              (let ((written (with-temp-buffer
+                               (insert-file-contents output)
+                               (buffer-string))))
+                (should (string-match-p "\\[\\[file:assets/img1.png\\]\\]"
+                                        written))
+                (should (string-match-p "#\\+attr_org: .*:width 640"
+                                        written))))))
+      (ignore-errors (delete-file output t)))))
+
+(ert-deftest org-lark-test-async-pipeline-fallback-on-download-error ()
+  "When a media download fails, the placeholder substitutes the
+fallback comment instead of a file link."
+  (let ((output (expand-file-name "org-lark-async-fail-test.org"
+                                  temporary-file-directory)))
+    (unwind-protect
+        (org-lark-test--with-pandoc-stub
+          (cl-letf (((symbol-function 'org-lark-fetch-async)
+                     (lambda (_doc cb)
+                       (funcall cb nil
+                                '((markdown . "<image token=\"x\"/>")
+                                  (title . "T") (doc_id . "d1")))))
+                    ((symbol-function 'org-lark--download-media-async)
+                     (lambda (_token _type _st cb)
+                       (funcall cb "boom" nil))))
+            (let ((org-lark-overwrite t)
+                  (org-lark-download-media t)
+                  (org-lark-open-after-export nil))
+              (org-lark-export "doc" output)
+              (let ((written (with-temp-buffer
+                               (insert-file-contents output)
+                               (buffer-string))))
+                (should (string-match-p "Lark image token: x" written))
+                (should-not (string-match-p "\\[\\[file:" written))))))
+      (ignore-errors (delete-file output t)))))
+
+(ert-deftest org-lark-test-async-callback-receives-output-path ()
+  "`org-lark-export-async' invokes its callback with (nil PATH) on success."
+  (let ((output (expand-file-name "org-lark-cb-test.org"
+                                  temporary-file-directory))
+        seen-err seen-path)
+    (unwind-protect
+        (org-lark-test--with-pandoc-stub
+          (cl-letf (((symbol-function 'org-lark-fetch-async)
+                     (lambda (_doc cb)
+                       (funcall cb nil
+                                '((markdown . "# Hi")
+                                  (title . "T") (doc_id . "d"))))))
+            (let ((org-lark-overwrite t)
+                  (org-lark-download-media nil))
+              (org-lark-export-async
+               "doc" output
+               (lambda (err path)
+                 (setq seen-err err seen-path path)))
+              ;; Drain the event loop until the callback ran.
+              (let ((deadline (+ (float-time) 2)))
+                (while (and (not seen-path) (< (float-time) deadline))
+                  (accept-process-output nil 0.05)))
+              (should-not seen-err)
+              (should (equal seen-path output))
+              (should (file-exists-p output)))))
+      (ignore-errors (delete-file output t)))))
 
 (ert-deftest org-lark-test-single-pandoc-call ()
   "Ensure Pandoc is invoked exactly once, not once per block."
