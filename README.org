@@ -1,5 +1,7 @@
 #+title: org-lark
 
+[[https://melpa.org/#/org-lark][file:https://melpa.org/packages/org-lark-badge.svg]]
+
 Export Lark/Feishu documents to Org files.
 
 Fetches Markdown via [[https://github.com/larksuite/cli][lark-cli]], normalizes Lark-specific custom blocks
@@ -13,6 +15,14 @@ See the full sample export: [[file:example/exported.org][example/exported.org]]
 - [[https://pandoc.org/][pandoc]]
 
 * Install
+
+From [[https://melpa.org/#/org-lark][MELPA]]:
+
+#+begin_src elisp
+M-x package-install RET org-lark RET
+#+end_src
+
+Or manually:
 
 #+begin_src elisp
 (add-to-list 'load-path "/path/to/org-lark")
