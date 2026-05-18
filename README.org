@@ -2,7 +2,7 @@
 
 [[https://melpa.org/#/org-lark][file:https://melpa.org/packages/org-lark-badge.svg]]
 
-Export Lark/Feishu documents to Org files.
+Two-way bridge between Lark/Feishu docs and Org files.
 
 Fetches Markdown via [[https://github.com/larksuite/cli][lark-cli]], normalizes Lark-specific custom blocks
 (tables, quotes, callouts, grids, ...), and converts into an Org file.
@@ -62,6 +62,44 @@ Org image link such as:
 [[file:assets/example.png]]
 #+end_src
 
+* Publish
+
+Push an Org file back up to Lark.  If the file's =#+lark_doc_id:=
+header is set, the existing remote doc is overwritten; otherwise a
+new doc is created and the doc id / URL are written back into the
+local file's header.
+
+#+begin_src elisp
+;; Interactive
+M-x org-lark-publish
+
+;; From Lisp (async; callback gets (ERR URL))
+(org-lark-publish-async "~/notes/export.org"
+                        (lambda (err url)
+                          (message "→ %s" (or url err))))
+#+end_src
+
+The pipeline reverses the export:
+
+1. Strip Org keyword headers; remember =#+title=, =#+lark_doc_id=,
+   =#+lark_source=, and an optional =#+lark_parent:= (e.g.
+   =folder:TOKEN= or =wiki:SPACE/NODE=).
+2. Reverse-map =#+begin_lark_grid= / =_column= / =_chat_card= /
+   =_addon= / =_source_synced= / =_reference_synced= / =_view=,
+   =#+begin_quote= with =#+attr_org=, and =#+begin_example= with
+   =:emoji= back into Lark custom tags.
+3. Reverse-map =[[lark-doc:..]]=, =[[lark-user:..]]=,
+   =[[lark-task:..]]=, =[[lark-sheet:..]]= into the corresponding
+   inline tags.
+4. Run Pandoc once (=org → gfm --wrap=none=).
+5. For each =[[file:..]]= image/attachment: reuse the cached Lark
+   token when the file's SHA-256 is unchanged; otherwise upload
+   via =lark-cli docs +media-upload= and cache the returned token
+   in =org-lark-media-cache-file=.
+6. Call =lark-cli docs +create= (new doc) or =docs +update --mode
+   overwrite= (existing).  When creating, the new doc id and URL
+   are written back into the local file's header.
+
 * Debugging
 
 =M-x org-lark-toggle-debug= opens a read-only =*org-lark-log*= buffer
@@ -70,16 +108,20 @@ tag match counts, and per-step timing.
 
 * Customization
 
-| Variable                     | Default     | Description                         |
-|------------------------------+-------------+-------------------------------------|
-| =org-lark-cli-program=      | ="lark-cli"= | Path to lark-cli                    |
-| =org-lark-pandoc-program=   | ="pandoc"=  | Path to pandoc                      |
-| =org-lark-identity=         | ="user"=    | =--as= identity for lark-cli       |
-| =org-lark-download-media=   | =t=         | Download images/files/whiteboards   |
-| =org-lark-assets-directory= | ="assets"=  | Asset sub-directory                 |
-| =org-lark-timeout=          | =30=        | Seconds before killing a subprocess |
-| =org-lark-open-after-export= | =t=         | Visit converted file after export   |
-| =org-lark-debug=            | =nil=       | Log to =*org-lark-log*= buffer     |
+| Variable                            | Default       | Description                                                  |
+|-------------------------------------+---------------+--------------------------------------------------------------|
+| =org-lark-cli-program=              | ="lark-cli"=    | Path to lark-cli                                             |
+| =org-lark-pandoc-program=           | ="pandoc"=      | Path to pandoc                                               |
+| =org-lark-identity=                 | ="user"=        | =--as= identity for lark-cli                                  |
+| =org-lark-download-media=           | =t=             | Download images/files/whiteboards                            |
+| =org-lark-assets-directory=         | ="assets"=      | Asset sub-directory                                          |
+| =org-lark-timeout=                  | =30=            | Seconds before killing a subprocess                          |
+| =org-lark-open-after-export=        | =t=             | Visit converted file after export                            |
+| =org-lark-debug=                    | =nil=           | Log to =*org-lark-log*= buffer                                |
+| =org-lark-publish-default-parent=   | =nil=           | Fallback parent for created docs (=folder:T= or =wiki:S/N=) |
+| =org-lark-publish-update-mode=      | ="overwrite"=   | Mode for =docs +update= on re-publish                         |
+| =org-lark-confirm-overwrite-remote= | =t=             | Prompt before overwriting an existing remote doc             |
+| =org-lark-media-cache-file=         | =org-lark-media.eld= | Persistent media-upload cache (per-user)                |
 
 * Tests
 

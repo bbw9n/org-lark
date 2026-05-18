@@ -90,6 +90,30 @@
 Toggle interactively with `org-lark-toggle-debug'."
   :type 'boolean)
 
+(defcustom org-lark-publish-default-parent nil
+  "Default parent for newly-created Lark docs.
+String of the form \"folder:TOKEN\" or \"wiki:SPACE/NODE\", or nil.
+Overridden by a per-file =#+lark_parent:= keyword."
+  :type '(choice (const nil) string))
+
+(defcustom org-lark-publish-update-mode "overwrite"
+  "Mode passed to =lark-cli docs +update= when re-publishing.
+The default \"overwrite\" replaces the whole document body."
+  :type '(choice (const "overwrite") (const "append")
+                 (const "replace_all") string))
+
+(defcustom org-lark-confirm-overwrite-remote t
+  "When non-nil, prompt before overwriting an existing remote doc.
+Skipped for non-interactive callers."
+  :type 'boolean)
+
+(defcustom org-lark-media-cache-file
+  (locate-user-emacs-file "org-lark-media.eld")
+  "Where to persist the media upload cache.
+The cache maps (absolute-path . sha256) → uploaded Lark token so
+unchanged assets reuse their token across publish runs."
+  :type 'file)
+
 ;;;; Logging ───────────────────────────────────────────────────────
 
 (defconst org-lark--log-buffer-name "*org-lark-log*")
@@ -866,9 +890,18 @@ for file links.  Returns a placeholder key string."
     key))
 
 (defun org-lark--restore-placeholders (text st)
-  "Replace every placeholder in TEXT with its stored value from ST."
-  (let ((result text))
-    (dolist (entry (org-lark--state-placeholders st) result)
+  "Replace every placeholder in TEXT with its stored value from ST.
+ST may be either an `org-lark--state' (read path) or an
+`org-lark--pubstate' (publish path)."
+  (let ((result text)
+        (entries (cond
+                  ((org-lark--state-p st)
+                   (org-lark--state-placeholders st))
+                  ((org-lark--pubstate-p st)
+                   (org-lark--pubstate-placeholders st))
+                  (t (error "Unknown state type passed to restore: %S"
+                            (type-of st))))))
+    (dolist (entry entries result)
       (setq result (replace-regexp-in-string
                     (regexp-quote (car entry))
                     (lambda (_) (cdr entry))
@@ -1246,6 +1279,732 @@ Call DONE-CALLBACK with the results alist when all jobs finish."
 (defun org-lark--relative-path (path st)
   "Return PATH relative to the output file directory in ST."
   (file-relative-name path (file-name-directory (org-lark--state-output-file st))))
+
+;;;; Publish (Org → Lark) ──────────────────────────────────────────
+;;
+;; Reverse pipeline: parse an Org file → strip metadata → reverse-map
+;; #+begin_lark_* blocks and [[lark-*:..]] links back to Lark custom
+;; tags → pandoc org→gfm → upload any new media → docs +create or
+;; +update via lark-cli.  Mirrors the read path structure so the two
+;; halves share helpers (placeholders, async runners, logging).
+
+(cl-defstruct org-lark--pubstate
+  "Mutable bag threaded through a single publish run."
+  org-file body title doc-token parent
+  (placeholders nil) (counter 0)
+  ;; Media: each pending upload is (REL-PATH . PLIST), where PLIST has
+  ;; :abs :token :attrs :name.  Resolved tokens accumulate in :tokens
+  ;; as (REL-PATH . TOKEN) so the marker pass can substitute inline.
+  (media-jobs nil) (media-tokens nil)
+  ;; New tokens to persist back into the org file's #+attr_org lines.
+  (new-attr-tokens nil))
+
+(defvar org-lark--media-cache nil
+  "Loaded media cache: alist of (KEY . TOKEN) where KEY is (ABS-PATH . SHA).")
+
+(defvar org-lark--media-cache-loaded nil
+  "Non-nil once `org-lark--media-cache' has been read from disk.")
+
+(defun org-lark--media-cache-load ()
+  "Lazily populate `org-lark--media-cache' from disk."
+  (unless org-lark--media-cache-loaded
+    (setq org-lark--media-cache-loaded t
+          org-lark--media-cache
+          (and (file-readable-p org-lark-media-cache-file)
+               (with-temp-buffer
+                 (insert-file-contents org-lark-media-cache-file)
+                 (condition-case _ (read (current-buffer))
+                   (error nil)))))))
+
+(defun org-lark--media-cache-save ()
+  "Persist `org-lark--media-cache' to disk."
+  (condition-case err
+      (let ((file org-lark-media-cache-file))
+        (make-directory (file-name-directory file) t)
+        (with-temp-file file
+          (let ((print-length nil) (print-level nil))
+            (prin1 org-lark--media-cache (current-buffer)))))
+    (error (org-lark--log "media-cache save failed: %s"
+                          (error-message-string err)))))
+
+(defun org-lark--file-sha256 (path)
+  "Return the SHA-256 digest of PATH's contents, or nil on error."
+  (condition-case _
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally path)
+        (secure-hash 'sha256 (current-buffer)))
+    (error nil)))
+
+(defun org-lark--media-cache-get (abs-path)
+  "Return cached token for ABS-PATH, or nil."
+  (org-lark--media-cache-load)
+  (let ((sha (org-lark--file-sha256 abs-path)))
+    (when sha
+      (cdr (assoc (cons abs-path sha) org-lark--media-cache)))))
+
+(defun org-lark--media-cache-put (abs-path token)
+  "Store TOKEN for ABS-PATH in the persistent media cache."
+  (when (and abs-path token)
+    (let ((sha (org-lark--file-sha256 abs-path)))
+      (when sha
+        (org-lark--media-cache-load)
+        (let ((key (cons abs-path sha)))
+          (setq org-lark--media-cache
+                (cons (cons key token)
+                      (cl-remove-if (lambda (e) (equal (car e) key))
+                                    org-lark--media-cache))))
+        (org-lark--media-cache-save)))))
+
+;;; Org header parsing
+
+(defun org-lark--parse-org-header (text)
+  "Split TEXT into a (HEADER-ALIST . BODY) pair.
+HEADER-ALIST contains values keyed by lowercased keyword strings
+for every leading =#+keyword: value= line.  BODY is the rest."
+  (let ((header nil) (lines (split-string text "\n")) (i 0))
+    (cl-loop
+     for line in lines
+     while (or (string-match-p "^[ \t]*$" line)
+               (string-match "^#\\+\\([A-Za-z_][A-Za-z0-9_]*\\):[ \t]*\\(.*\\)$"
+                             line))
+     do (progn
+          (when (string-match
+                 "^#\\+\\([A-Za-z_][A-Za-z0-9_]*\\):[ \t]*\\(.*\\)$" line)
+            (push (cons (downcase (match-string 1 line))
+                        (string-trim (match-string 2 line)))
+                  header))
+          (cl-incf i)))
+    (cons (nreverse header)
+          (string-trim (string-join (nthcdr i lines) "\n")))))
+
+(defun org-lark--parse-parent (spec)
+  "Parse SPEC like \"folder:TOKEN\" or \"wiki:SPACE/NODE\" into a plist."
+  (cond
+   ((or (null spec) (string-empty-p spec)) nil)
+   ((string-match "^folder:\\(.+\\)$" spec)
+    (list :folder-token (string-trim (match-string 1 spec))))
+   ((string-match "^wiki:\\([^/]+\\)\\(?:/\\(.+\\)\\)?$" spec)
+    (list :wiki-space (string-trim (match-string 1 spec))
+          :wiki-node  (and (match-string 2 spec)
+                           (string-trim (match-string 2 spec)))))
+   (t (list :folder-token spec))))
+
+;;; Reverse normalization (Org → Lark Markdown)
+
+(defun org-lark--rev-ph (value st)
+  "Push VALUE into ST and return a unique placeholder token.
+Shares the format of read-path placeholders so we can reuse
+`org-lark--restore-placeholders' verbatim."
+  (let ((key (format "%s%d_"
+                     org-lark--ph-prefix
+                     (cl-incf (org-lark--pubstate-counter st)))))
+    (push (cons key value) (org-lark--pubstate-placeholders st))
+    key))
+
+(defun org-lark--rev-attr-pairs (attr-line)
+  "Parse a leading =#+attr_org:= ATTR-LINE into an alist of (KEY . VALUE).
+Splits on whitespace before `:KEY' tokens (Emacs has no lookahead)."
+  (let (pairs)
+    (when (and attr-line
+               (string-match "^#\\+attr_org:[ \t]*\\(.*\\)$" attr-line))
+      (let* ((rest (match-string 1 attr-line))
+             ;; Insert a sentinel before every `:KEY' that follows
+             ;; whitespace so we can split cleanly.
+             (norm (replace-regexp-in-string
+                    "[ \t]+:\\([A-Za-z][A-Za-z0-9_-]*\\)[ \t]+"
+                    "\x01:\\1 " rest))
+             (parts (split-string norm "\x01" t)))
+        (dolist (part parts)
+          (when (string-match "^:\\([A-Za-z][A-Za-z0-9_-]*\\)[ \t]+\\(.*\\)$"
+                              part)
+            (push (cons (match-string 1 part)
+                        (string-trim (match-string 2 part)))
+                  pairs)))))
+    (nreverse pairs)))
+
+(defun org-lark--rev-render-attrs (pairs &optional drop-keys)
+  "Render PAIRS into an XML-ish attribute string.
+DROP-KEYS is a list of attribute names to omit."
+  (mapconcat
+   (lambda (p)
+     (format " %s=\"%s\"" (car p)
+             (replace-regexp-in-string "\"" "&quot;" (cdr p))))
+   (cl-remove-if (lambda (p) (member (car p) drop-keys)) pairs)
+   ""))
+
+(defun org-lark--rev-code-blocks (text st)
+  "Replace =#+begin_src= blocks in TEXT with fenced placeholders.
+ST collects placeholders so pandoc does not reflow code.
+=#+begin_example= is intentionally left for
+`org-lark--rev-blocks-with-attrs', which decides between callout
+(when a =#+attr_org:= line carries Lark keys) and plain fenced
+output."
+  (org-lark--re-replace
+   text
+   "^#\\+begin_src\\(?:[ \t]+\\([^\n]*\\)\\)?\n\\(\\(?:.\\|\n\\)*?\\)\n#\\+end_src[ \t]*$"
+   (lambda ()
+     (let* ((info (or (match-string 1) ""))
+            (body (match-string 2))
+            (lang (when (string-match "^[[:alnum:]_+-]+" info)
+                    (match-string 0 info))))
+       (org-lark--rev-ph
+        (format "\n```%s\n%s\n```\n" (or lang "") body)
+        st)))))
+
+(defun org-lark--rev-blocks-with-attrs (text st)
+  "Replace =#+begin_…= blocks with reverse-mapped Lark tags in TEXT.
+ST collects placeholders.  Handles =lark_grid=, =lark_column=,
+=lark_chat_card=, =lark_addon=, =lark_source_synced=,
+=lark_reference_synced=, =lark_view=, =example= (callout), =quote=."
+  ;; Two anchored `^` clauses inside one regex (one in an optional
+  ;; group, one not) silently fail to match in Emacs even when the
+  ;; optional group is skipped, so the begin-line uses no anchor and
+  ;; relies on the fact that code blocks were already protected.
+  (let ((re (concat
+             "\\(?:^#\\+attr_org:[ \t]*\\([^\n]*\\)\n\\)?"
+             "#\\+begin_\\([A-Za-z_]+\\)[ \t]*\n"
+             "\\(\\(?:.\\|\n\\)*?\\)\n"
+             "#\\+end_\\2[ \t]*$")))
+    (org-lark--re-replace
+     text re
+     (lambda ()
+       (let* ((attr-line (and (match-string 1)
+                              (concat "#+attr_org: " (match-string 1))))
+              (name (match-string 2))
+              (body (match-string 3))
+              (pairs (org-lark--rev-attr-pairs attr-line)))
+         (org-lark--rev-dispatch-block name pairs body st))))))
+
+(defun org-lark--rev-dispatch-block (name pairs body st)
+  "Return Lark-tag replacement for org block NAME with attribute PAIRS and BODY.
+ST is the publish state."
+  (pcase name
+    ("lark_grid"
+     (let ((inner (org-lark--rev-blocks-with-attrs body st)))
+       (org-lark--rev-ph
+        (format "<grid%s>\n%s\n</grid>"
+                (org-lark--rev-render-attrs pairs)
+                (string-trim inner))
+        st)))
+    ("lark_column"
+     (org-lark--rev-ph
+      (format "<column%s>\n%s\n</column>"
+              (org-lark--rev-render-attrs pairs)
+              (string-trim (org-lark--rev-blocks-with-attrs body st)))
+      st))
+    ("lark_chat_card"
+     (org-lark--rev-ph
+      (format "<chat-card%s/>" (org-lark--rev-render-attrs pairs)) st))
+    ("lark_addon"
+     (org-lark--rev-ph
+      (format "<add-ons%s/>" (org-lark--rev-render-attrs pairs)) st))
+    ("lark_source_synced"
+     (org-lark--rev-ph
+      (format "<source-synced%s>\n%s\n</source-synced>"
+              (org-lark--rev-render-attrs pairs)
+              (org-lark--rev-blocks-with-attrs body st))
+      st))
+    ("lark_reference_synced"
+     (org-lark--rev-ph
+      (format "<reference-synced%s>\n%s\n</reference-synced>"
+              (org-lark--rev-render-attrs pairs)
+              (org-lark--rev-blocks-with-attrs body st))
+      st))
+    ("lark_view"
+     (org-lark--rev-ph
+      (format "<view%s>\n%s\n</view>"
+              (org-lark--rev-render-attrs pairs)
+              (org-lark--rev-blocks-with-attrs body st))
+      st))
+    ("example"
+     (cond
+      ;; Callout: had #+attr_org with at least one Lark-callout-ish key.
+      ((or (assoc "emoji" pairs) (assoc "background-color" pairs)
+           (assoc "border-color" pairs))
+       (org-lark--rev-ph
+        (format "<callout%s>\n%s\n</callout>"
+                (org-lark--rev-render-attrs pairs)
+                (string-trim (org-lark--rev-blocks-with-attrs body st)))
+        st))
+      (t
+       ;; Plain example → fall back to a fenced block.
+       (org-lark--rev-ph
+        (format "\n```\n%s\n```\n" body) st))))
+    ("quote"
+     (org-lark--rev-ph
+      (format "<quote-container%s>\n%s\n</quote-container>"
+              (org-lark--rev-render-attrs pairs)
+              (string-trim (org-lark--rev-blocks-with-attrs body st)))
+      st))
+    (_
+     ;; Unknown block: leave the original text untouched (re-emit).
+     (let ((attr (if pairs
+                     (format "#+attr_org:%s\n"
+                             (org-lark--rev-render-attrs pairs))
+                   "")))
+       (format "%s#+begin_%s\n%s\n#+end_%s" attr name body name)))))
+
+(defun org-lark--rev-images (text st)
+  "Replace =[[file:..]]= references in TEXT with media markers.
+Honours a preceding =#+attr_org: :token TOK= line: if present the
+token is reused directly (emits <image token=…/>).  Otherwise the
+asset is queued in ST for upload after the doc exists."
+  (org-lark--re-replace
+   text
+   (concat
+    "\\(?:#\\+attr_org:[ \t]*\\([^\n]*\\)\n\\)?"
+    "\\[\\[file:\\([^]]+\\)\\]\\(?:\\[\\([^]]*\\)\\]\\)?\\]")
+   (lambda ()
+     (let* ((attr-line (and (match-string 1)
+                            (concat "#+attr_org: " (match-string 1))))
+            (path  (match-string 2))
+            (label (match-string 3))
+            (pairs (org-lark--rev-attr-pairs attr-line))
+            (token (cdr (assoc "token" pairs)))
+            (file-p (and label (not (string-empty-p label))
+                         (not (member (file-name-extension path)
+                                      '("png" "jpg" "jpeg" "gif" "webp"
+                                        "svg" "bmp")))))
+            (rel path)
+            (abs (expand-file-name
+                  path (file-name-directory
+                        (org-lark--pubstate-org-file st)))))
+       (cond
+        ;; Already has a Lark token from a previous fetch: reuse.
+        (token
+         (org-lark--rev-ph
+          (if file-p
+              (format "<file token=\"%s\" name=\"%s\"/>"
+                      token (or label ""))
+            (format "<image token=\"%s\"%s/>"
+                    token
+                    (org-lark--rev-render-attrs pairs '("token"))))
+          st))
+        ;; Local asset: queue for upload, emit a stable marker token
+        ;; that we substitute inline once a token is known.  The
+        ;; marker is wrapped in a placeholder so pandoc does not
+        ;; reflow or split it; placeholder restoration brings it
+        ;; back into the MD before media substitution runs.
+        ((file-readable-p abs)
+         (let* ((marker (format "ORGLARKMEDIA__%d__"
+                                (1+ (org-lark--pubstate-counter st))))
+                (ph (org-lark--rev-ph marker st)))
+           (push (cons rel
+                       (list :abs abs :attrs pairs :name (or label "")
+                             :kind (if file-p 'file 'image)
+                             :marker marker))
+                 (org-lark--pubstate-media-jobs st))
+           ph))
+        ;; Unreadable local path: keep the raw text so the user
+        ;; notices.  Render as a Markdown link.
+        (t
+         (format "[%s](%s)" (or label rel) rel)))))))
+
+(defun org-lark--rev-lark-links (text st)
+  "Reverse-map Org Lark-* link syntax in TEXT to inline tags via ST."
+  ;; mention-user
+  (setq text
+        (org-lark--re-replace
+         text "\\[\\[lark-user:\\([^]]*\\)\\]\\[@?\\([^]]*\\)\\]\\]"
+         (lambda ()
+           (org-lark--rev-ph
+            (format "<mention-user id=\"%s\"/>" (match-string 1))
+            st))))
+  ;; mention-doc
+  (setq text
+        (org-lark--re-replace
+         text "\\[\\[lark-doc:\\([^]]+\\)\\]\\[\\([^]]*\\)\\]\\][ \t]*\\(?:# type: \\([^\n]*\\)\\)?"
+         (lambda ()
+           (let ((tok (match-string 1))
+                 (label (match-string 2))
+                 (type (or (match-string 3) "")))
+             (org-lark--rev-ph
+              (format "<mention-doc token=\"%s\" type=\"%s\">%s</mention-doc>"
+                      tok (string-trim type) label)
+              st)))))
+  ;; lark-task
+  (setq text
+        (org-lark--re-replace
+         text "\\[\\[lark-task:\\([^]]*\\)\\]\\[[^]]*\\]\\]"
+         (lambda ()
+           (org-lark--rev-ph
+            (format "<task task-id=\"%s\"/>" (match-string 1)) st))))
+  ;; lark-sheet
+  (setq text
+        (org-lark--re-replace
+         text "\\[\\[lark-sheet:\\([^]]*\\)\\]\\[[^]]*\\]\\]"
+         (lambda ()
+           (org-lark--rev-ph
+            (format "<sheet token=\"%s\"/>" (match-string 1)) st))))
+  text)
+
+(defun org-lark--rev-normalize (text st)
+  "Run all reverse-mapping passes over TEXT, accumulating in ST."
+  (let ((t0 (float-time)))
+    (org-lark--log "publish: %d chars input" (length text))
+    (setq text (org-lark--rev-code-blocks text st))
+    (org-lark--log "  code blocks → %d placeholders"
+                   (org-lark--pubstate-counter st))
+    (setq text (org-lark--rev-blocks-with-attrs text st))
+    (setq text (org-lark--rev-images text st))
+    (setq text (org-lark--rev-lark-links text st))
+    (org-lark--log "  reverse-normalize → %d placeholders, %d media jobs, %.2fs"
+                   (org-lark--pubstate-counter st)
+                   (length (org-lark--pubstate-media-jobs st))
+                   (- (float-time) t0))
+    text))
+
+;;; Pandoc org→gfm
+
+(defun org-lark--pandoc-org-to-md-async (org callback)
+  "Async: convert ORG to GFM Markdown via pandoc, call CALLBACK (ERR MD)."
+  (org-lark--msg "running pandoc...")
+  (let ((in-file (make-temp-file "org-lark-pub-" nil ".org")))
+    (with-temp-file in-file (insert org))
+    (org-lark--run-async
+     org-lark-pandoc-program
+     (list "-f" "org" "-t" "gfm" "--wrap=none" in-file)
+     (lambda (err out)
+       (ignore-errors (delete-file in-file t))
+       (funcall callback err out)))))
+
+;;; Media upload
+
+(defun org-lark--upload-media-async (job doc-token callback)
+  "Upload a single media JOB to the doc identified by DOC-TOKEN.
+Calls CALLBACK with (ERR TOKEN).  Uses the on-disk media cache to
+short-circuit unchanged files."
+  (let* ((abs (plist-get (cdr job) :abs))
+         (cached (org-lark--media-cache-get abs)))
+    (cond
+     (cached
+      (org-lark--log "media cache hit %s → %s" abs cached)
+      (funcall callback nil cached))
+     (t
+      (let* ((kind (plist-get (cdr job) :kind))
+             (parent-type (if (eq kind 'file) "docx_file" "docx_image"))
+             (args (list "docs" "+media-upload"
+                         "--as" org-lark-identity
+                         "--doc-id" doc-token
+                         "--parent-type" parent-type
+                         "--file" abs)))
+        (org-lark--log "media upload %s (%s)" abs parent-type)
+        (org-lark--run-json-async
+         org-lark-cli-program args
+         (lambda (err json)
+           (org-lark--upload-media-handle-result
+            err json abs callback))))))))
+
+(defun org-lark--upload-media-handle-result (err json abs callback)
+  "Process the lark-cli media-upload response and call CALLBACK (ERR TOKEN).
+ABS is the local file path; on success it gets cached against the
+returned token."
+  (cond
+   (err (funcall callback err nil))
+   ((not (alist-get 'ok json))
+    (funcall callback
+             (format "media-upload: %s"
+                     (json-encode (or (alist-get 'error json) json)))
+             nil))
+   (t (let* ((data (alist-get 'data json))
+             (token (or (alist-get 'file_token data)
+                        (alist-get 'token data)
+                        (alist-get 'media_token data))))
+        (cond
+         (token (org-lark--media-cache-put abs token)
+                (funcall callback nil token))
+         (t (funcall callback
+                     "media-upload: no token in response"
+                     nil)))))))
+
+(defun org-lark--upload-all-media-async (st doc-token done-callback)
+  "Upload every queued job in ST against DOC-TOKEN, then call DONE-CALLBACK.
+DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
+  (let* ((jobs (org-lark--pubstate-media-jobs st))
+         (n (length jobs))
+         (remaining n)
+         (results nil))
+    (cond
+     ((zerop n) (funcall done-callback nil))
+     (t
+      (org-lark--msg "uploading %d media item(s)..." n)
+      (dolist (job jobs)
+        (let ((rel (car job)))
+          (org-lark--upload-media-async
+           job doc-token
+           (lambda (err token)
+             (push (cons rel (cons err token)) results)
+             (cl-decf remaining)
+             (org-lark--msg "uploading media %d/%d..." (- n remaining) n)
+             (when (zerop remaining)
+               (funcall done-callback results))))))))))
+
+(defun org-lark--substitute-media-tokens (text st results)
+  "Replace media marker placeholders in TEXT using RESULTS for ST."
+  (let ((out text))
+    (dolist (job (org-lark--pubstate-media-jobs st) out)
+      (let* ((rel (car job))
+             (plist (cdr job))
+             (marker (plist-get plist :marker))
+             (kind (plist-get plist :kind))
+             (name (plist-get plist :name))
+             (attrs (plist-get plist :attrs))
+             (download (cdr (assoc rel results)))
+             (err (car-safe download))
+             (token (cdr-safe download))
+             (replacement
+              (cond
+               ((and (not err) token)
+                (push (cons rel token)
+                      (org-lark--pubstate-new-attr-tokens st))
+                (cond
+                 ((eq kind 'file)
+                  (format "<file token=\"%s\" name=\"%s\"/>" token name))
+                 (t
+                  (format "<image token=\"%s\"%s/>" token
+                          (org-lark--rev-render-attrs attrs '("token"))))))
+               (t
+                (org-lark--log "media failed for %s: %s" rel err)
+                (format "[%s](%s)" (or name rel) rel)))))
+        (setq out (replace-regexp-in-string
+                   (regexp-quote marker)
+                   (lambda (_) replacement)
+                   out t t))))))
+
+;;; lark-cli docs +create / +update wrappers
+
+(defun org-lark--docs-create-async (title markdown parent callback)
+  "Async wrapper for =docs +create=.  Calls CALLBACK with (ERR DATA-ALIST).
+PARENT is the parsed plist from `org-lark--parse-parent' or nil."
+  (let ((md-file (make-temp-file "org-lark-pub-" nil ".md")))
+    (with-temp-file md-file (insert markdown))
+    (let ((args (append
+                 (list "docs" "+create"
+                       "--as" org-lark-identity
+                       "--title" title
+                       "--markdown" (concat "@" md-file))
+                 (when (plist-get parent :folder-token)
+                   (list "--folder-token" (plist-get parent :folder-token)))
+                 (when (plist-get parent :wiki-space)
+                   (list "--wiki-space" (plist-get parent :wiki-space)))
+                 (when (plist-get parent :wiki-node)
+                   (list "--wiki-node" (plist-get parent :wiki-node))))))
+      (org-lark--run-json-async
+       org-lark-cli-program args
+       (lambda (err json)
+         (ignore-errors (delete-file md-file t))
+         (cond
+          (err (funcall callback err nil))
+          ((not (alist-get 'ok json))
+           (funcall callback
+                    (format "docs +create: %s"
+                            (json-encode
+                             (or (alist-get 'error json) json)))
+                    nil))
+          (t (funcall callback nil (alist-get 'data json)))))))))
+
+(defun org-lark--docs-update-async (doc-token title markdown callback)
+  "Async wrapper for =docs +update= in overwrite mode.
+TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
+  (let ((md-file (make-temp-file "org-lark-pub-" nil ".md")))
+    (with-temp-file md-file (insert markdown))
+    (let ((args (append
+                 (list "docs" "+update"
+                       "--as" org-lark-identity
+                       "--doc" doc-token
+                       "--mode" org-lark-publish-update-mode
+                       "--markdown" (concat "@" md-file))
+                 (when title (list "--new-title" title)))))
+      (org-lark--run-json-async
+       org-lark-cli-program args
+       (lambda (err json)
+         (ignore-errors (delete-file md-file t))
+         (cond
+          (err (funcall callback err nil))
+          ((not (alist-get 'ok json))
+           (funcall callback
+                    (format "docs +update: %s"
+                            (json-encode
+                             (or (alist-get 'error json) json)))
+                    nil))
+          (t (funcall callback nil (alist-get 'data json)))))))))
+
+;;; Header write-back (for newly-created docs)
+
+(defun org-lark--write-header-back (org-file doc-id source-url)
+  "Insert =#+lark_doc_id:= and =#+lark_source:= into ORG-FILE if missing."
+  (when (and org-file (file-writable-p org-file))
+    (with-temp-buffer
+      (insert-file-contents org-file)
+      (let ((dirty nil))
+        (unless (save-excursion
+                  (goto-char (point-min))
+                  (re-search-forward "^#\\+lark_doc_id:" nil t))
+          (goto-char (point-min))
+          (if (re-search-forward "^#\\+title:.*\n" nil t)
+              (progn (forward-line 0) (forward-line 1))
+            (goto-char (point-min)))
+          (insert (format "#+lark_doc_id: %s\n" doc-id))
+          (setq dirty t))
+        (unless (save-excursion
+                  (goto-char (point-min))
+                  (re-search-forward "^#\\+lark_source:" nil t))
+          (goto-char (point-min))
+          (if (re-search-forward "^#\\+lark_doc_id:.*\n" nil t)
+              nil
+            (goto-char (point-min)))
+          (insert (format "#+lark_source: %s\n" source-url))
+          (setq dirty t))
+        (when dirty
+          (write-region (point-min) (point-max) org-file nil 'quiet))))))
+
+;;; Main publish pipeline
+
+(defun org-lark--publish-pipeline-async (st callback)
+  "Drive the full publish pipeline for ST, then call CALLBACK (ERR URL)."
+  (let* ((body (org-lark--pubstate-body st))
+         (md-with-markers (org-lark--rev-normalize body st)))
+    (org-lark--pandoc-org-to-md-async
+     md-with-markers
+     (lambda (err md)
+       (cond
+        (err (funcall callback err nil))
+        (t
+         (let ((md (org-lark--restore-placeholders md st)))
+           (org-lark--publish-finish-async st md callback))))))))
+
+(defun org-lark--publish-finish-async (st md callback)
+  "Run create-or-update + media upload for ST and MD.  CALLBACK gets (ERR URL)."
+  (let ((doc-token (org-lark--pubstate-doc-token st))
+        (title (org-lark--pubstate-title st)))
+    (cond
+     ;; Update path: upload media first (we already have a doc token),
+     ;; then push the body in one call.
+     (doc-token
+      (org-lark--upload-all-media-async
+       st doc-token
+       (lambda (results)
+         (let ((md (org-lark--substitute-media-tokens md st results)))
+           (org-lark--docs-update-async
+            doc-token title md
+            (lambda (err data)
+              (cond
+               (err (funcall callback err nil))
+               (t (funcall callback nil
+                           (or (alist-get 'url data)
+                               (org-lark--pubstate-doc-token st)))))))))))
+     ;; Create path: create with markers, then upload media against the
+     ;; freshly minted doc token, then a second +update swaps the
+     ;; markers for real <image token=…/> tags.
+     (t
+      (org-lark--docs-create-async
+       title md (org-lark--pubstate-parent st)
+       (lambda (err data)
+         (cond
+          (err (funcall callback err nil))
+          (t
+           (let* ((new-token (or (alist-get 'document_id data)
+                                 (alist-get 'doc_id data)
+                                 (alist-get 'token data)))
+                  (url (alist-get 'url data)))
+             (setf (org-lark--pubstate-doc-token st) new-token)
+             (org-lark--write-header-back
+              (org-lark--pubstate-org-file st) new-token (or url ""))
+             (cond
+              ;; No media to attach → first +create already wrote
+              ;; everything (markers will remain visible in the doc;
+              ;; user can rename / fix manually for v1).
+              ((null (org-lark--pubstate-media-jobs st))
+               (funcall callback nil url))
+              (t
+               (org-lark--upload-all-media-async
+                st new-token
+                (lambda (results)
+                  (let ((md (org-lark--substitute-media-tokens
+                             md st results)))
+                    (org-lark--docs-update-async
+                     new-token nil md
+                     (lambda (err2 _data2)
+                       (cond
+                        (err2 (funcall callback err2 nil))
+                        (t (funcall callback nil url)))))))))))))))))))
+
+;;; Public commands
+
+;;;###autoload
+(defun org-lark-publish-async (org-file callback)
+  "Publish ORG-FILE to Lark asynchronously.
+CALLBACK is invoked with (ERR URL) on completion: ERR is nil on
+success and URL is the doc URL (or token, if URL is unavailable);
+on failure ERR is a descriptive string and URL is nil."
+  (let* ((org-file (expand-file-name org-file))
+         (text (with-temp-buffer
+                 (insert-file-contents org-file)
+                 (buffer-string)))
+         (parsed (org-lark--parse-org-header text))
+         (header (car parsed))
+         (body   (cdr parsed))
+         (title  (or (cdr (assoc "title" header))
+                     (file-name-base org-file)))
+         (doc-id (let ((v (cdr (assoc "lark_doc_id" header))))
+                   (and v (not (string-empty-p v)) v)))
+         (parent (org-lark--parse-parent
+                  (or (cdr (assoc "lark_parent" header))
+                      org-lark-publish-default-parent)))
+         (st (make-org-lark--pubstate
+              :org-file org-file :body body
+              :title title :doc-token doc-id :parent parent)))
+    (org-lark--log "publish %s → %s"
+                   org-file (or doc-id "(create)"))
+    (org-lark--msg "publishing %s..." (file-name-nondirectory org-file))
+    (org-lark--publish-pipeline-async st callback)
+    nil))
+
+;;;###autoload
+(defun org-lark-publish (&optional org-file)
+  "Publish ORG-FILE (or the current buffer's file) to Lark.
+
+When the file's =#+lark_doc_id:= header is set, the existing
+remote document is updated with `org-lark-publish-update-mode'
+(after a confirmation prompt if `org-lark-confirm-overwrite-remote'
+is non-nil).  Otherwise a new document is created and the doc id
+and URL are written back into the local file's header.
+
+Runs asynchronously; the buffer stays responsive throughout."
+  (interactive)
+  (let* ((org-file (or org-file
+                       (buffer-file-name)
+                       (read-file-name "Org file to publish: ")))
+         (text (with-temp-buffer
+                 (insert-file-contents org-file)
+                 (buffer-string)))
+         (header (car (org-lark--parse-org-header text)))
+         (doc-id (let ((v (cdr (assoc "lark_doc_id" header))))
+                   (and v (not (string-empty-p v)) v))))
+    (when (and doc-id
+               org-lark-confirm-overwrite-remote
+               (called-interactively-p 'interactive)
+               (not (y-or-n-p
+                     (format "Overwrite remote Lark doc %s? " doc-id))))
+      (user-error "org-lark: publish cancelled"))
+    (org-lark-publish-async
+     org-file
+     (lambda (err url)
+       (cond
+        (err (message "org-lark: publish failed: %s" err))
+        (t (message "org-lark: published → %s" (or url "(no url)"))))))))
+
+;;;###autoload
+(defun org-lark-publish-buffer ()
+  "Publish the current buffer (must be visiting a file) to Lark."
+  (interactive)
+  (unless (buffer-file-name)
+    (user-error "Buffer is not visiting a file"))
+  (when (buffer-modified-p)
+    (when (y-or-n-p "Buffer modified.  Save first? ")
+      (save-buffer)))
+  (org-lark-publish (buffer-file-name)))
 
 (provide 'org-lark)
 

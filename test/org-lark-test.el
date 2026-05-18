@@ -383,6 +383,235 @@ fallback comment instead of a file link."
         (org-lark--pipeline md '((title . "T")) "u" st)
         (should (= pandoc-count 1))))))
 
+;;; Publish path ───────────────────────────────────────────────────
+
+(defun org-lark-test--pubst (&optional org-file)
+  "Throwaway publish state pointing at ORG-FILE (or a tmp path)."
+  (make-org-lark--pubstate
+   :org-file (or org-file
+                 (expand-file-name "in.org" temporary-file-directory))
+   :body ""))
+
+(defun org-lark-test--reverse (text &optional org-file)
+  "Reverse-normalize TEXT and restore placeholders; helper for tests."
+  (let* ((st (org-lark-test--pubst org-file))
+         (out (org-lark--rev-normalize text st)))
+    (org-lark--restore-placeholders out st)))
+
+(ert-deftest org-lark-test-parse-org-header ()
+  "Leading #+keywords parse into the header alist and strip from body."
+  (let* ((text (concat "#+title: My doc\n"
+                       "#+lark_doc_id: AB123\n"
+                       "#+lark_source: https://example/doc\n"
+                       "#+created_by: org-lark\n\n"
+                       "Body line one.\n"))
+         (parsed (org-lark--parse-org-header text)))
+    (should (equal "My doc" (cdr (assoc "title" (car parsed)))))
+    (should (equal "AB123" (cdr (assoc "lark_doc_id" (car parsed)))))
+    (should (string-prefix-p "Body line one" (cdr parsed)))
+    (should-not (string-match-p "#\\+title" (cdr parsed)))))
+
+(ert-deftest org-lark-test-parse-parent ()
+  "Folder / wiki parent specs round-trip through `org-lark--parse-parent'."
+  (let ((folder (org-lark--parse-parent "folder:TOK1"))
+        (wiki   (org-lark--parse-parent "wiki:SPACE_X/NODE_Y")))
+    (should (equal "TOK1" (plist-get folder :folder-token)))
+    (should-not (plist-get folder :wiki-space))
+    (should (equal "SPACE_X" (plist-get wiki :wiki-space)))
+    (should (equal "NODE_Y" (plist-get wiki :wiki-node)))))
+
+(ert-deftest org-lark-test-reverse-code-block ()
+  "Org src/example blocks reverse-map to fenced markdown."
+  (let* ((org "#+begin_src python\nprint(1)\n#+end_src")
+         (out (org-lark-test--reverse org)))
+    (should (string-match-p "```python\nprint(1)\n```" out))))
+
+(ert-deftest org-lark-test-reverse-grid ()
+  "lark_grid + lark_column reverse to <grid>/<column>."
+  (let* ((org (concat
+               "#+begin_lark_grid\n"
+               "#+begin_lark_column\n"
+               "A\n"
+               "#+end_lark_column\n"
+               "#+begin_lark_column\n"
+               "B\n"
+               "#+end_lark_column\n"
+               "#+end_lark_grid"))
+         (out (org-lark-test--reverse org)))
+    (should (string-match-p "<grid>" out))
+    (should (string-match-p "<column>" out))
+    (should (= 2 (cl-count-if
+                  (lambda (l) (string-match-p "<column>" l))
+                  (split-string out "\n"))))))
+
+(ert-deftest org-lark-test-reverse-callout ()
+  "example block with :emoji attr reverses to <callout …>."
+  (let* ((org (concat
+               "#+attr_org: :emoji 💡 :background-color light-yellow\n"
+               "#+begin_example\n"
+               "Tip body.\n"
+               "#+end_example"))
+         (out (org-lark-test--reverse org)))
+    (should (string-match-p "<callout[^>]*emoji=\"💡\"" out))
+    (should (string-match-p "background-color=\"light-yellow\"" out))
+    (should (string-match-p "Tip body\\." out))))
+
+(ert-deftest org-lark-test-reverse-mentions ()
+  "lark-doc / lark-user / lark-task / lark-sheet links reverse to tags."
+  (let ((out (org-lark-test--reverse
+              (concat "[[lark-doc:TOK1][Some Doc]] # type: doc\n"
+                      "[[lark-user:U_ABC][@user]]\n"
+                      "[[lark-task:TID][Lark task]]\n"
+                      "[[lark-sheet:STK][Lark sheet]]"))))
+    (should (string-match-p
+             "<mention-doc token=\"TOK1\" type=\"doc\">Some Doc</mention-doc>"
+             out))
+    (should (string-match-p "<mention-user id=\"U_ABC\"/>" out))
+    (should (string-match-p "<task task-id=\"TID\"/>" out))
+    (should (string-match-p "<sheet token=\"STK\"/>" out))))
+
+(ert-deftest org-lark-test-reverse-image-with-token ()
+  "[[file:..]] preceded by #+attr_org: :token T reuses the token."
+  (let* ((org (concat
+               "#+attr_org: :token TKN :width 640\n"
+               "[[file:assets/foo.png]]"))
+         (out (org-lark-test--reverse org)))
+    (should (string-match-p "<image token=\"TKN\"" out))
+    (should (string-match-p "width=\"640\"" out))
+    (should-not (string-match-p "ORGLARKMEDIA" out))))
+
+(ert-deftest org-lark-test-reverse-image-without-token-queues-upload ()
+  "[[file:..]] without :token queues a media job and emits a marker."
+  (let ((tmp (make-temp-file "org-lark-pub-img-" nil ".png")))
+    (unwind-protect
+        (let* ((org-file (make-temp-file "org-lark-pub-" nil ".org"))
+               (rel (file-relative-name
+                     tmp (file-name-directory org-file)))
+               (st (org-lark-test--pubst org-file))
+               (out (org-lark--rev-normalize
+                     (format "[[file:%s]]" rel) st))
+               (restored (org-lark--restore-placeholders out st))
+               (jobs (org-lark--pubstate-media-jobs st)))
+          (should (= 1 (length jobs)))
+          (should (equal rel (caar jobs)))
+          (should (string-match-p "ORGLARKMEDIA" restored))
+          (should (eq 'image (plist-get (cdar jobs) :kind)))
+          ;; The marker stored in the job matches the post-restoration
+          ;; text, so substitution can locate it later.
+          (should (string-match-p
+                   (regexp-quote (plist-get (cdar jobs) :marker))
+                   restored)))
+      (ignore-errors (delete-file tmp t)))))
+
+(ert-deftest org-lark-test-publish-create-routes-to-create ()
+  "No #+lark_doc_id → docs +create is invoked with title + parent."
+  (let* ((org-file (make-temp-file "org-lark-pub-" nil ".org"))
+         (saw-create nil) (saw-update nil) (got-err nil) (got-url nil))
+    (unwind-protect
+        (progn
+          (with-temp-file org-file
+            (insert "#+title: Hello World\n\nBody.\n"))
+          (cl-letf
+              (((symbol-function 'org-lark--pandoc-org-to-md-async)
+                (lambda (org cb) (funcall cb nil org)))
+               ((symbol-function 'org-lark--docs-create-async)
+                (lambda (title md _parent cb)
+                  (setq saw-create (list :title title :md md))
+                  (funcall cb nil
+                           '((document_id . "NEW_DOC")
+                             (url . "https://lark/NEW_DOC")))))
+               ((symbol-function 'org-lark--docs-update-async)
+                (lambda (&rest _args)
+                  (setq saw-update t))))
+            (org-lark-publish-async
+             org-file
+             (lambda (err url) (setq got-err err got-url url)))
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (not got-url) (not got-err)
+                          (< (float-time) deadline))
+                (accept-process-output nil 0.05))))
+          (should-not got-err)
+          (should saw-create)
+          (should-not saw-update)
+          (should (equal "Hello World" (plist-get saw-create :title)))
+          (should (equal "https://lark/NEW_DOC" got-url))
+          ;; Header was written back into the org file.
+          (with-temp-buffer
+            (insert-file-contents org-file)
+            (should (string-match-p "^#\\+lark_doc_id: NEW_DOC$"
+                                    (buffer-string)))))
+      (ignore-errors (delete-file org-file t)))))
+
+(ert-deftest org-lark-test-publish-update-routes-to-update ()
+  "#+lark_doc_id header → docs +update with --new-title."
+  (let* ((org-file (make-temp-file "org-lark-pub-" nil ".org"))
+         (saw-create nil) (saw-update nil) (got-url nil))
+    (unwind-protect
+        (progn
+          (with-temp-file org-file
+            (insert "#+title: New Title\n#+lark_doc_id: EXISTING\n\nBody.\n"))
+          (cl-letf
+              (((symbol-function 'org-lark--pandoc-org-to-md-async)
+                (lambda (org cb) (funcall cb nil org)))
+               ((symbol-function 'org-lark--docs-create-async)
+                (lambda (&rest _) (setq saw-create t)))
+               ((symbol-function 'org-lark--docs-update-async)
+                (lambda (doc title md cb)
+                  (setq saw-update (list :doc doc :title title :md md))
+                  (funcall cb nil '((url . "https://lark/EXISTING"))))))
+            (org-lark-publish-async
+             org-file
+             (lambda (_err url) (setq got-url url)))
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (not got-url) (< (float-time) deadline))
+                (accept-process-output nil 0.05))))
+          (should-not saw-create)
+          (should saw-update)
+          (should (equal "EXISTING" (plist-get saw-update :doc)))
+          (should (equal "New Title" (plist-get saw-update :title)))
+          (should (equal "https://lark/EXISTING" got-url)))
+      (ignore-errors (delete-file org-file t)))))
+
+(ert-deftest org-lark-test-publish-cache-skips-upload ()
+  "Cached media tokens are reused without invoking lark-cli."
+  (let* ((png (make-temp-file "org-lark-pub-img-" nil ".png"))
+         (org-file (make-temp-file "org-lark-pub-" nil ".org"))
+         (rel (file-relative-name png (file-name-directory org-file)))
+         (orig-cache (copy-tree org-lark--media-cache))
+         (orig-loaded org-lark--media-cache-loaded)
+         (got-url nil) (upload-calls 0))
+    (unwind-protect
+        (progn
+          (with-temp-file png (insert "PNGDATA"))
+          (with-temp-file org-file
+            (insert (format "#+title: T\n#+lark_doc_id: D1\n\n[[file:%s]]\n" rel)))
+          ;; Pre-seed cache for the file so reuse short-circuits upload.
+          (let ((org-lark--media-cache-loaded t)
+                (org-lark--media-cache nil))
+            (org-lark--media-cache-put png "CACHED_TOK")
+            (cl-letf
+                (((symbol-function 'org-lark--pandoc-org-to-md-async)
+                  (lambda (org cb) (funcall cb nil org)))
+                 ((symbol-function 'org-lark--media-cache-save) #'ignore)
+                 ((symbol-function 'org-lark--run-json-async)
+                  (lambda (_p _a _cb) (cl-incf upload-calls)))
+                 ((symbol-function 'org-lark--docs-update-async)
+                  (lambda (_d _t md cb)
+                    (should (string-match-p
+                             "<image token=\"CACHED_TOK\"" md))
+                    (funcall cb nil '((url . "u"))))))
+              (org-lark-publish-async
+               org-file (lambda (_e u) (setq got-url u)))
+              (let ((deadline (+ (float-time) 2)))
+                (while (and (not got-url) (< (float-time) deadline))
+                  (accept-process-output nil 0.05))))
+            (should (equal "u" got-url))
+            (should (zerop upload-calls))))
+      (setq org-lark--media-cache orig-cache
+            org-lark--media-cache-loaded orig-loaded)
+      (ignore-errors (delete-file png t))
+      (ignore-errors (delete-file org-file t)))))
+
 (provide 'org-lark-test)
 
 ;;; org-lark-test.el ends here
