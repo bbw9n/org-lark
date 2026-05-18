@@ -313,6 +313,7 @@ ST is the mutable export state."
                                 (org-lark--state-counter st) (length text)))
            (org  (org-lark--pandoc text))
            (org  (org-lark--restore-placeholders org st))
+           (org  (org-lark--normalize-attr-keyword-lines org))
            (org  (org-lark--fix-deep-headings org))
            (org  (replace-regexp-in-string "\n\\{3,\\}" "\n\n" (string-trim org))))
       (org-lark--log "pipeline: %.2fs total" (- (float-time) t0))
@@ -351,6 +352,7 @@ calls CALLBACK with (ERR ORG-STRING)."
           (err (funcall callback err nil))
           (t
            (let* ((org-text (org-lark--restore-placeholders org-text st))
+                  (org-text (org-lark--normalize-attr-keyword-lines org-text))
                   (org-text (org-lark--fix-deep-headings org-text)))
              (org-lark--download-all-media-async
               st
@@ -416,10 +418,15 @@ ST is the mutable export state."
   (pcase tag
     ("equation"
      (org-lark--ph (concat "\n\\[\n" (string-trim body) "\n\\]\n") st))
+    ;; Native Org block keeps native rendering; the `lark-block'
+    ;; sentinel in #+attr_org disambiguates from a plain quote/example
+    ;; on republish, even if `#+attr_org' ends up inlined inside a list.
     ((or "quote-container" "quote")
-     (org-lark--wrap-block attrs body st "quote"))
+     (org-lark--wrap-block (org-lark--with-sentinel "quote-container" attrs)
+                           body st "quote"))
     ("callout"
-     (org-lark--wrap-block attrs body st "example"))
+     (org-lark--wrap-block (org-lark--with-sentinel "callout" attrs)
+                           body st "example"))
     ("lark-table"
      (org-lark--tag-table attrs body st))
     ("grid"
@@ -1231,6 +1238,20 @@ Call DONE-CALLBACK with the results alist when all jobs finish."
      (concat (make-string (length (match-string 1)) ?*)
              " " (match-string 2)))))
 
+(defun org-lark--normalize-attr-keyword-lines (text)
+  "Ensure every `#+attr_org:' keyword in TEXT sits at column 0 on its own line.
+Pandoc occasionally glues placeholder-restored `#+attr_org:' onto a
+preceding list-bullet line or leaves it indented; either form breaks
+the publish-side `^#+attr_org:' anchor and silently loses the
+`lark-block' sentinel on a round-trip."
+  ;; Inlined after non-newline text: "...bullet  #+attr_org: ..." \u2192 split.
+  (setq text (replace-regexp-in-string
+              "\\([^\n]\\)[ \t]+#\\+attr_org:" "\\1\n#+attr_org:" text))
+  ;; Indented on its own line: "  #+attr_org: ..." \u2192 unindent.
+  (setq text (replace-regexp-in-string
+              "^[ \t]+#\\+attr_org:" "#+attr_org:" text))
+  text)
+
 ;;;; Attribute / formatting helpers ────────────────────────────────
 
 (defun org-lark--parse-attrs (attrs)
@@ -1255,6 +1276,12 @@ Call DONE-CALLBACK with the results alist when all jobs finish."
                            pairs " ")
                 "\n")
       "")))
+
+(defun org-lark--with-sentinel (kind attrs)
+  "Prepend a =lark-block=KIND= sentinel to the XML-ish ATTRS string.
+Used so reverse-mapping can recognize a `quote'/`example' block as
+the original Lark tag without relying on attribute heuristics."
+  (concat (format "lark-block=\"%s\" " kind) (or attrs "")))
 
 (defun org-lark--props-from-attrs (attrs)
   "Build :PROPERTY: lines from ATTRS string."
@@ -1518,25 +1545,41 @@ ST is the publish state."
               (org-lark--rev-blocks-with-attrs body st))
       st))
     ("example"
-     (cond
-      ;; Callout: had #+attr_org with at least one Lark-callout-ish key.
-      ((or (assoc "emoji" pairs) (assoc "background-color" pairs)
-           (assoc "border-color" pairs))
-       (org-lark--rev-ph
-        (format "<callout%s>\n%s\n</callout>"
-                (org-lark--rev-render-attrs pairs)
-                (string-trim (org-lark--rev-blocks-with-attrs body st)))
-        st))
-      (t
-       ;; Plain example → fall back to a fenced block.
-       (org-lark--rev-ph
-        (format "\n```\n%s\n```\n" body) st))))
+     (let* ((sentinel (cdr (assoc "lark-block" pairs)))
+            (others   (cl-remove-if (lambda (p) (string= (car p) "lark-block"))
+                                    pairs)))
+       (cond
+        ;; New: explicit `lark-block="callout"' sentinel.
+        ((equal sentinel "callout")
+         (org-lark--rev-ph
+          (format "<callout%s>\n%s\n</callout>"
+                  (org-lark--rev-render-attrs others)
+                  (string-trim (org-lark--rev-blocks-with-attrs body st)))
+          st))
+        ;; Legacy: pre-sentinel org files identified callouts heuristically
+        ;; by the presence of any callout-only attribute.
+        ((or (assoc "emoji" pairs) (assoc "background-color" pairs)
+             (assoc "border-color" pairs))
+         (org-lark--rev-ph
+          (format "<callout%s>\n%s\n</callout>"
+                  (org-lark--rev-render-attrs pairs)
+                  (string-trim (org-lark--rev-blocks-with-attrs body st)))
+          st))
+        (t
+         ;; Plain example → fall back to a fenced block.
+         (org-lark--rev-ph
+          (format "\n```\n%s\n```\n" body) st)))))
     ("quote"
-     (org-lark--rev-ph
-      (format "<quote-container%s>\n%s\n</quote-container>"
-              (org-lark--rev-render-attrs pairs)
-              (string-trim (org-lark--rev-blocks-with-attrs body st)))
-      st))
+     ;; Any `#+begin_quote' becomes a `<quote-container>'.  Strip the
+     ;; sentinel (if present from a previous Lark export) so we don't
+     ;; round-trip it back to Lark.
+     (let ((others (cl-remove-if (lambda (p) (string= (car p) "lark-block"))
+                                 pairs)))
+       (org-lark--rev-ph
+        (format "<quote-container%s>\n%s\n</quote-container>"
+                (org-lark--rev-render-attrs others)
+                (string-trim (org-lark--rev-blocks-with-attrs body st)))
+        st)))
     (_
      ;; Unknown block: leave the original text untouched (re-emit).
      (let ((attr (if pairs
@@ -1643,6 +1686,9 @@ asset is queued in ST for upload after the doc exists."
   "Run all reverse-mapping passes over TEXT, accumulating in ST."
   (let ((t0 (float-time)))
     (org-lark--log "publish: %d chars input" (length text))
+    ;; Fix up `#+attr_org:` that pandoc may have glued onto a list line
+    ;; or indented, so the block-recognizer sees it.
+    (setq text (org-lark--normalize-attr-keyword-lines text))
     (setq text (org-lark--rev-code-blocks text st))
     (org-lark--log "  code blocks → %d placeholders"
                    (org-lark--pubstate-counter st))
