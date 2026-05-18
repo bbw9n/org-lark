@@ -876,7 +876,11 @@ Honours `org-lark--defer-media' the same way as `org-lark--sc-media'."
 
 (defun org-lark--ph (value st)
   "Store VALUE in ST, return a unique placeholder token."
-  (let ((key (format "%s%d_"
+  ;; Terminator is a letter (`Z') rather than `_' so pandoc's GFM writer
+  ;; doesn't escape it as italic-marker punctuation (e.g. `ORGLARKPH1_'
+  ;; → `ORGLARKPH1\_'), which would silently break placeholder
+  ;; restoration and drop every Lark block we wrapped.
+  (let ((key (format "%s%dZ"
                      org-lark--ph-prefix
                      (cl-incf (org-lark--state-counter st)))))
     (push (cons key value) (org-lark--state-placeholders st))
@@ -888,7 +892,7 @@ KIND is `image', `whiteboard', or `file'.  TOKEN/TYPE are forwarded
 to lark-cli +media-download.  ATTRS is the original tag attrs string
 (used to render #+attr_org on success).  NAME is the display label
 for file links.  Returns a placeholder key string."
-  (let ((key (format "%s%d_"
+  (let ((key (format "%s%dZ"
                      org-lark--ph-prefix
                      (cl-incf (org-lark--state-counter st)))))
     (push (cons key (list :kind kind :token token :type type
@@ -1423,7 +1427,7 @@ for every leading =#+keyword: value= line.  BODY is the rest."
   "Push VALUE into ST and return a unique placeholder token.
 Shares the format of read-path placeholders so we can reuse
 `org-lark--restore-placeholders' verbatim."
-  (let ((key (format "%s%d_"
+  (let ((key (format "%s%dZ"
                      org-lark--ph-prefix
                      (cl-incf (org-lark--pubstate-counter st)))))
     (push (cons key value) (org-lark--pubstate-placeholders st))
