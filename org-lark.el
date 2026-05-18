@@ -1777,13 +1777,18 @@ DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
 (defun org-lark--docs-create-async (title markdown parent callback)
   "Async wrapper for =docs +create=.  Calls CALLBACK with (ERR DATA-ALIST).
 PARENT is the parsed plist from `org-lark--parse-parent' or nil."
-  (let ((md-file (make-temp-file "org-lark-pub-" nil ".md")))
+  ;; lark-cli requires =--markdown @file= to be a relative path inside
+  ;; the subprocess's cwd, so bind `default-directory' to the temp dir
+  ;; and pass only the basename.
+  (let* ((md-file (make-temp-file "org-lark-pub-" nil ".md"))
+         (default-directory (file-name-directory md-file))
+         (md-rel (file-name-nondirectory md-file)))
     (with-temp-file md-file (insert markdown))
     (let ((args (append
                  (list "docs" "+create"
                        "--as" org-lark-identity
                        "--title" title
-                       "--markdown" (concat "@" md-file))
+                       "--markdown" (concat "@" md-rel))
                  (when (plist-get parent :folder-token)
                    (list "--folder-token" (plist-get parent :folder-token)))
                  (when (plist-get parent :wiki-space)
@@ -1807,14 +1812,17 @@ PARENT is the parsed plist from `org-lark--parse-parent' or nil."
 (defun org-lark--docs-update-async (doc-token title markdown callback)
   "Async wrapper for =docs +update= in overwrite mode.
 TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
-  (let ((md-file (make-temp-file "org-lark-pub-" nil ".md")))
+  ;; See `org-lark--docs-create-async' for why we rebind `default-directory'.
+  (let* ((md-file (make-temp-file "org-lark-pub-" nil ".md"))
+         (default-directory (file-name-directory md-file))
+         (md-rel (file-name-nondirectory md-file)))
     (with-temp-file md-file (insert markdown))
     (let ((args (append
                  (list "docs" "+update"
                        "--as" org-lark-identity
                        "--doc" doc-token
                        "--mode" org-lark-publish-update-mode
-                       "--markdown" (concat "@" md-file))
+                       "--markdown" (concat "@" md-rel))
                  (when title (list "--new-title" title)))))
       (org-lark--run-json-async
        org-lark-cli-program args
