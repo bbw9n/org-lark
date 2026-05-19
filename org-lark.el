@@ -1712,11 +1712,16 @@ asset is queued in ST for upload after the doc exists."
   (org-lark--msg "running pandoc...")
   (let ((in-file (make-temp-file "org-lark-pub-" nil ".org")))
     (with-temp-file in-file (insert org))
+    (org-lark--log "pandoc org→gfm input (%d bytes, placeholders intact):\n---8<---\n%s\n--->8---"
+                   (length org) org)
     (org-lark--run-async
      org-lark-pandoc-program
      (list "-f" "org" "-t" "gfm" "--wrap=none" in-file)
      (lambda (err out)
        (ignore-errors (delete-file in-file t))
+       (unless err
+         (org-lark--log "pandoc org→gfm output (%d bytes, before placeholder restore):\n---8<---\n%s\n--->8---"
+                        (length out) out))
        (funcall callback err out)))))
 
 ;;; Media upload
@@ -1930,6 +1935,8 @@ TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
         (err (funcall callback err nil))
         (t
          (let ((md (org-lark--restore-placeholders md st)))
+           (org-lark--log "publish final markdown (%d bytes, after placeholder restore):\n---8<---\n%s\n--->8---"
+                          (length md) md)
            (org-lark--publish-finish-async st md callback))))))))
 
 (defun org-lark--publish-finish-async (st md callback)
