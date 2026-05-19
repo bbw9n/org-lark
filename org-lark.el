@@ -1389,16 +1389,35 @@ the original Lark tag without relying on attribute heuristics."
 
 ;;; Org header parsing
 
+(defconst org-lark--affiliated-keywords
+  '("caption" "data" "header" "headers" "label" "name" "plot"
+    "results" "source" "srcname" "tblname")
+  "Org affiliated keywords that bind to the following element.
+These must not be consumed by `org-lark--parse-org-header', or the
+attached block loses its metadata.  `attr_*' is handled separately
+via prefix match since the suffix varies (`attr_org', `attr_html', …).")
+
+(defun org-lark--header-keyword-p (kw)
+  "Return non-nil if KW is a top-level keyword safe to absorb as a header.
+Excludes affiliated keywords like =attr_org= / =caption= / =name=
+that belong with the block immediately below them."
+  (not (or (string-prefix-p "attr_" kw)
+           (member kw org-lark--affiliated-keywords))))
+
 (defun org-lark--parse-org-header (text)
   "Split TEXT into a (HEADER-ALIST . BODY) pair.
 HEADER-ALIST contains values keyed by lowercased keyword strings
-for every leading =#+keyword: value= line.  BODY is the rest."
+for leading =#+keyword: value= lines.  Affiliated keywords (see
+`org-lark--affiliated-keywords' and the `attr_*' family) terminate
+header parsing so they stay attached to their block in BODY."
   (let ((header nil) (lines (split-string text "\n")) (i 0))
     (cl-loop
      for line in lines
      while (or (string-match-p "^[ \t]*$" line)
-               (string-match "^#\\+\\([A-Za-z_][A-Za-z0-9_]*\\):[ \t]*\\(.*\\)$"
-                             line))
+               (and (string-match
+                     "^#\\+\\([A-Za-z_][A-Za-z0-9_]*\\):[ \t]*\\(.*\\)$" line)
+                    (org-lark--header-keyword-p
+                     (downcase (match-string 1 line)))))
      do (progn
           (when (string-match
                  "^#\\+\\([A-Za-z_][A-Za-z0-9_]*\\):[ \t]*\\(.*\\)$" line)
