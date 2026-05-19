@@ -36,10 +36,10 @@ without spawning a real Pandoc process."
 (defun org-lark-test--convert (markdown)
   "Convenience: convert MARKDOWN with pandoc stub."
   (org-lark-test--with-pandoc-stub
-    (let ((st (org-lark-test--st)))
-      (org-lark--pipeline markdown
-                          '((title . "Test") (doc_id . "d1"))
-                          "test-url" st))))
+   (let ((st (org-lark-test--st)))
+     (org-lark--pipeline markdown
+                         '((title . "Test") (doc_id . "d1"))
+                         "test-url" st))))
 
 (defun org-lark-test--arg-after (flag args)
   "Return the value after FLAG in ARGS."
@@ -87,15 +87,15 @@ without spawning a real Pandoc process."
 
 (ert-deftest org-lark-test-self-closing-links ()
   (org-lark-test--with-pandoc-stub
-    (let* ((st (org-lark-test--st))
-           (org-lark-download-media nil)
-           (out (org-lark--pipeline
-                 "<mention-user id=\"ou_abcdef123456\"/>\n<sheet token=\"sheet_1\"/>\n<task task-id=\"task_1\"/>\n<link-preview url=\"https%3A%2F%2Fexample.com\"/>"
-                 '((title . "T") (doc_id . "d1")) "u" st)))
-      (should (string-match-p "\\[\\[lark-user:ou_abcdef123456\\]" out))
-      (should (string-match-p "\\[\\[lark-sheet:sheet_1\\]" out))
-      (should (string-match-p "\\[\\[lark-task:task_1\\]" out))
-      (should (string-match-p "\\[\\[https://example.com\\]" out)))))
+   (let* ((st (org-lark-test--st))
+          (org-lark-download-media nil)
+          (out (org-lark--pipeline
+                "<mention-user id=\"ou_abcdef123456\"/>\n<sheet token=\"sheet_1\"/>\n<task task-id=\"task_1\"/>\n<link-preview url=\"https%3A%2F%2Fexample.com\"/>"
+                '((title . "T") (doc_id . "d1")) "u" st)))
+     (should (string-match-p "\\[\\[lark-user:ou_abcdef123456\\]" out))
+     (should (string-match-p "\\[\\[lark-sheet:sheet_1\\]" out))
+     (should (string-match-p "\\[\\[lark-task:task_1\\]" out))
+     (should (string-match-p "\\[\\[https://example.com\\]" out)))))
 
 (ert-deftest org-lark-test-equation ()
   (let ((out (org-lark-test--convert
@@ -127,30 +127,30 @@ without spawning a real Pandoc process."
                                   temporary-file-directory)))
     (unwind-protect
         (org-lark-test--with-pandoc-stub
-          (cl-letf (((symbol-function 'org-lark-fetch-async)
-                     (lambda (_doc cb)
-                       (funcall cb nil
-                                '((markdown . "# Hello")
-                                  (title . "My Doc")
-                                  (doc_id . "doc1")))))
-                    ((symbol-function 'find-file)
-                     (lambda (&rest _args)
-                       (setq opened t))))
-            (let ((org-lark-overwrite t)
-                  (org-lark-open-after-export t)
-                  (org-lark-download-media nil))
-              (should (equal (org-lark-export "doc" output) output))
-              (should-not opened)
-              (should (file-exists-p output)))))
+         (cl-letf (((symbol-function 'org-lark-fetch-async)
+                    (lambda (_doc cb)
+                      (funcall cb nil
+                               '((markdown . "# Hello")
+                                 (title . "My Doc")
+                                 (doc_id . "doc1")))))
+                   ((symbol-function 'find-file)
+                    (lambda (&rest _args)
+                      (setq opened t))))
+           (let ((org-lark-overwrite t)
+                 (org-lark-open-after-export t)
+                 (org-lark-download-media nil))
+             (should (equal (org-lark-export "doc" output) output))
+             (should-not opened)
+             (should (file-exists-p output)))))
       (delete-file output t))))
 
 (ert-deftest org-lark-test-media-download-path ()
   (let (seen-args)
     (cl-letf (((symbol-function 'org-lark--run-json)
-             (lambda (_program &rest args)
-               (setq seen-args args)
-               '((ok . t)
-                 (data . ((saved_path . "assets/tok.png")))))))
+               (lambda (_program &rest args)
+                 (setq seen-args args)
+                 '((ok . t)
+                   (data . ((saved_path . "assets/tok.png")))))))
       (let ((st (org-lark-test--st))
             (org-lark-download-media t))
         (should (equal (org-lark--download-media "tok" nil st)
@@ -163,57 +163,57 @@ without spawning a real Pandoc process."
 (ert-deftest org-lark-test-image-token-downloads-to-embedded-file-link ()
   (let (seen-args)
     (org-lark-test--with-pandoc-stub
-      (let* ((st (org-lark-test--st))
-             (saved-path (expand-file-name "img-token.png"
-                                           (org-lark--state-asset-dir st)))
-             (org-lark-download-media t))
-        (cl-letf (((symbol-function 'org-lark--run-json)
-                   (lambda (_program &rest args)
-                     (setq seen-args args)
-                     `((ok . t)
-                       (data . ((saved_path . ,saved-path)))))))
-          (let* ((org-lark-download-media t)
-                 (out (org-lark--pipeline
-                       "<image token=\"img-token\" width=\"640\" align=\"center\"/>"
-                       '((title . "T") (doc_id . "d1")) "u" st)))
-            (should (member "+media-download" seen-args))
-            (should (member "--token" seen-args))
-            (should (member "img-token" seen-args))
-            (should (equal (org-lark-test--arg-after "--output" seen-args)
-                           "assets/img-token"))
-            (should-not (file-name-absolute-p
-                         (org-lark-test--arg-after "--output" seen-args)))
-            (should-not (member "whiteboard" seen-args))
-            (should (string-match-p "#\\+attr_org: .*:width 640" out))
-            (should (string-match-p "\\[\\[file:assets/img-token.png\\]\\]" out))))))))
+     (let* ((st (org-lark-test--st))
+            (saved-path (expand-file-name "img-token.png"
+                                          (org-lark--state-asset-dir st)))
+            (org-lark-download-media t))
+       (cl-letf (((symbol-function 'org-lark--run-json)
+                  (lambda (_program &rest args)
+                    (setq seen-args args)
+                    `((ok . t)
+                      (data . ((saved_path . ,saved-path)))))))
+         (let* ((org-lark-download-media t)
+                (out (org-lark--pipeline
+                      "<image token=\"img-token\" width=\"640\" align=\"center\"/>"
+                      '((title . "T") (doc_id . "d1")) "u" st)))
+           (should (member "+media-download" seen-args))
+           (should (member "--token" seen-args))
+           (should (member "img-token" seen-args))
+           (should (equal (org-lark-test--arg-after "--output" seen-args)
+                          "assets/img-token"))
+           (should-not (file-name-absolute-p
+                        (org-lark-test--arg-after "--output" seen-args)))
+           (should-not (member "whiteboard" seen-args))
+           (should (string-match-p "#\\+attr_org: .*:width 640" out))
+           (should (string-match-p "\\[\\[file:assets/img-token.png\\]\\]" out))))))))
 
 (ert-deftest org-lark-test-whiteboard-token-downloads-thumbnail-link ()
   (let (seen-args)
     (org-lark-test--with-pandoc-stub
-      (let* ((st (org-lark-test--st))
-             (saved-path (expand-file-name "wb-token.png"
-                                           (org-lark--state-asset-dir st)))
-             (org-lark-download-media t))
-        (cl-letf (((symbol-function 'org-lark--run-json)
-                   (lambda (_program &rest args)
-                     (setq seen-args args)
-                     `((ok . t)
-                       (data . ((saved_path . ,saved-path)))))))
-          (let* ((org-lark-download-media t)
-                 (out (org-lark--pipeline
-                       "<whiteboard token=\"wb-token\" align=\"left\"/>"
-                       '((title . "T") (doc_id . "d1")) "u" st)))
-            (should (member "+media-download" seen-args))
-            (should (member "--token" seen-args))
-            (should (member "wb-token" seen-args))
-            (should (member "--type" seen-args))
-            (should (member "whiteboard" seen-args))
-            (should (equal (org-lark-test--arg-after "--output" seen-args)
-                           "assets/wb-token-wb"))
-            (should-not (file-name-absolute-p
-                         (org-lark-test--arg-after "--output" seen-args)))
-            (should (string-match-p "#\\+attr_org: .*:align left" out))
-            (should (string-match-p "\\[\\[file:assets/wb-token.png\\]\\]" out))))))))
+     (let* ((st (org-lark-test--st))
+            (saved-path (expand-file-name "wb-token.png"
+                                          (org-lark--state-asset-dir st)))
+            (org-lark-download-media t))
+       (cl-letf (((symbol-function 'org-lark--run-json)
+                  (lambda (_program &rest args)
+                    (setq seen-args args)
+                    `((ok . t)
+                      (data . ((saved_path . ,saved-path)))))))
+         (let* ((org-lark-download-media t)
+                (out (org-lark--pipeline
+                      "<whiteboard token=\"wb-token\" align=\"left\"/>"
+                      '((title . "T") (doc_id . "d1")) "u" st)))
+           (should (member "+media-download" seen-args))
+           (should (member "--token" seen-args))
+           (should (member "wb-token" seen-args))
+           (should (member "--type" seen-args))
+           (should (member "whiteboard" seen-args))
+           (should (equal (org-lark-test--arg-after "--output" seen-args)
+                          "assets/wb-token-wb"))
+           (should-not (file-name-absolute-p
+                        (org-lark-test--arg-after "--output" seen-args)))
+           (should (string-match-p "#\\+attr_org: .*:align left" out))
+           (should (string-match-p "\\[\\[file:assets/wb-token.png\\]\\]" out))))))))
 
 (ert-deftest org-lark-test-grid-and-columns ()
   (let ((out (org-lark-test--convert
@@ -286,33 +286,33 @@ in parallel, and substitutes resolved paths into the final org."
                                   temporary-file-directory)))
     (unwind-protect
         (org-lark-test--with-pandoc-stub
-          (cl-letf (((symbol-function 'org-lark-fetch-async)
-                     (lambda (_doc cb)
-                       (funcall cb nil
-                                '((markdown . "<image token=\"img1\" width=\"640\"/>")
-                                  (title . "T") (doc_id . "d1")))))
-                    ((symbol-function 'org-lark--download-media-async)
-                     (lambda (token type st cb)
-                       (push (list :token token :type type) download-args)
-                       (funcall cb nil
-                                (expand-file-name
-                                 (concat token ".png")
-                                 (org-lark--state-asset-dir st))))))
-            (let ((org-lark-overwrite t)
-                  (org-lark-download-media t)
-                  (org-lark-open-after-export nil))
-              (should (equal (org-lark-export "doc" output) output))
-              ;; Async path was used: download-media-async invoked once.
-              (should (= (length download-args) 1))
-              (should (equal (plist-get (car download-args) :token) "img1"))
-              ;; Final org contains the substituted file link.
-              (let ((written (with-temp-buffer
-                               (insert-file-contents output)
-                               (buffer-string))))
-                (should (string-match-p "\\[\\[file:assets/img1.png\\]\\]"
-                                        written))
-                (should (string-match-p "#\\+attr_org: .*:width 640"
-                                        written))))))
+         (cl-letf (((symbol-function 'org-lark-fetch-async)
+                    (lambda (_doc cb)
+                      (funcall cb nil
+                               '((markdown . "<image token=\"img1\" width=\"640\"/>")
+                                 (title . "T") (doc_id . "d1")))))
+                   ((symbol-function 'org-lark--download-media-async)
+                    (lambda (token type st cb)
+                      (push (list :token token :type type) download-args)
+                      (funcall cb nil
+                               (expand-file-name
+                                (concat token ".png")
+                                (org-lark--state-asset-dir st))))))
+           (let ((org-lark-overwrite t)
+                 (org-lark-download-media t)
+                 (org-lark-open-after-export nil))
+             (should (equal (org-lark-export "doc" output) output))
+             ;; Async path was used: download-media-async invoked once.
+             (should (= (length download-args) 1))
+             (should (equal (plist-get (car download-args) :token) "img1"))
+             ;; Final org contains the substituted file link.
+             (let ((written (with-temp-buffer
+                              (insert-file-contents output)
+                              (buffer-string))))
+               (should (string-match-p "\\[\\[file:assets/img1.png\\]\\]"
+                                       written))
+               (should (string-match-p "#\\+attr_org: .*:width 640"
+                                       written))))))
       (ignore-errors (delete-file output t)))))
 
 (ert-deftest org-lark-test-async-pipeline-fallback-on-download-error ()
@@ -322,23 +322,23 @@ fallback comment instead of a file link."
                                   temporary-file-directory)))
     (unwind-protect
         (org-lark-test--with-pandoc-stub
-          (cl-letf (((symbol-function 'org-lark-fetch-async)
-                     (lambda (_doc cb)
-                       (funcall cb nil
-                                '((markdown . "<image token=\"x\"/>")
-                                  (title . "T") (doc_id . "d1")))))
-                    ((symbol-function 'org-lark--download-media-async)
-                     (lambda (_token _type _st cb)
-                       (funcall cb "boom" nil))))
-            (let ((org-lark-overwrite t)
-                  (org-lark-download-media t)
-                  (org-lark-open-after-export nil))
-              (org-lark-export "doc" output)
-              (let ((written (with-temp-buffer
-                               (insert-file-contents output)
-                               (buffer-string))))
-                (should (string-match-p "Lark image token: x" written))
-                (should-not (string-match-p "\\[\\[file:" written))))))
+         (cl-letf (((symbol-function 'org-lark-fetch-async)
+                    (lambda (_doc cb)
+                      (funcall cb nil
+                               '((markdown . "<image token=\"x\"/>")
+                                 (title . "T") (doc_id . "d1")))))
+                   ((symbol-function 'org-lark--download-media-async)
+                    (lambda (_token _type _st cb)
+                      (funcall cb "boom" nil))))
+           (let ((org-lark-overwrite t)
+                 (org-lark-download-media t)
+                 (org-lark-open-after-export nil))
+             (org-lark-export "doc" output)
+             (let ((written (with-temp-buffer
+                              (insert-file-contents output)
+                              (buffer-string))))
+               (should (string-match-p "Lark image token: x" written))
+               (should-not (string-match-p "\\[\\[file:" written))))))
       (ignore-errors (delete-file output t)))))
 
 (ert-deftest org-lark-test-async-callback-receives-output-path ()
@@ -348,24 +348,24 @@ fallback comment instead of a file link."
         seen-err seen-path)
     (unwind-protect
         (org-lark-test--with-pandoc-stub
-          (cl-letf (((symbol-function 'org-lark-fetch-async)
-                     (lambda (_doc cb)
-                       (funcall cb nil
-                                '((markdown . "# Hi")
-                                  (title . "T") (doc_id . "d"))))))
-            (let ((org-lark-overwrite t)
-                  (org-lark-download-media nil))
-              (org-lark-export-async
-               "doc" output
-               (lambda (err path)
-                 (setq seen-err err seen-path path)))
-              ;; Drain the event loop until the callback ran.
-              (let ((deadline (+ (float-time) 2)))
-                (while (and (not seen-path) (< (float-time) deadline))
-                  (accept-process-output nil 0.05)))
-              (should-not seen-err)
-              (should (equal seen-path output))
-              (should (file-exists-p output)))))
+         (cl-letf (((symbol-function 'org-lark-fetch-async)
+                    (lambda (_doc cb)
+                      (funcall cb nil
+                               '((markdown . "# Hi")
+                                 (title . "T") (doc_id . "d"))))))
+           (let ((org-lark-overwrite t)
+                 (org-lark-download-media nil))
+             (org-lark-export-async
+              "doc" output
+              (lambda (err path)
+                (setq seen-err err seen-path path)))
+             ;; Drain the event loop until the callback ran.
+             (let ((deadline (+ (float-time) 2)))
+               (while (and (not seen-path) (< (float-time) deadline))
+                 (accept-process-output nil 0.05)))
+             (should-not seen-err)
+             (should (equal seen-path output))
+             (should (file-exists-p output)))))
       (ignore-errors (delete-file output t)))))
 
 (ert-deftest org-lark-test-single-pandoc-call ()
@@ -611,6 +611,166 @@ fallback comment instead of a file link."
             org-lark--media-cache-loaded orig-loaded)
       (ignore-errors (delete-file png t))
       (ignore-errors (delete-file org-file t)))))
+
+;;; Inline emphasis & CJK adjacency ────────────────────────────────
+
+(ert-deftest org-lark-test-pad-cjk-emphasis ()
+  "`org-lark--pad-cjk-emphasis' inserts spaces around CJK-adjacent emphasis."
+  ;; Closing delimiter abutting a CJK letter.
+  (should (equal "*项目：* 文本内容 X"
+                 (org-lark--pad-cjk-emphasis "*项目：*文本内容 X")))
+  ;; Opening delimiter abutting a CJK letter.
+  (should (equal "用户 *重要* 然后"
+                 (org-lark--pad-cjk-emphasis "用户*重要*然后")))
+  ;; All five emphasis flavours are padded.
+  (should (equal "X /斜/ Y"
+                 (org-lark--pad-cjk-emphasis "X/斜/Y")))
+  (should (equal "X =代码= Y"
+                 (org-lark--pad-cjk-emphasis "X=代码=Y")))
+  (should (equal "X +删除+ Y"
+                 (org-lark--pad-cjk-emphasis "X+删除+Y")))
+  ;; Pure ASCII context is left untouched.
+  (should (equal "ASCII *bold* text"
+                 (org-lark--pad-cjk-emphasis "ASCII *bold* text")))
+  ;; Already-padded input is idempotent.
+  (should (equal "*项目：* 文本内容"
+                 (org-lark--pad-cjk-emphasis "*项目：* 文本内容"))))
+
+(ert-deftest org-lark-test-header-skips-affiliated-keywords ()
+  "`#+attr_org:' is an affiliated keyword and must stay attached to its block.
+Earlier the header parser greedily ate any `#+keyword:' line, which
+silently stripped the `:lark-block' sentinel from callouts."
+  (let* ((text (concat "#+title: T\n"
+                       "#+lark_doc_id: ABC\n\n"
+                       "#+attr_org: :lark-block callout :emoji x\n"
+                       "#+begin_example\n"
+                       "body\n"
+                       "#+end_example\n"))
+         (parsed (org-lark--parse-org-header text))
+         (header (car parsed))
+         (body (cdr parsed)))
+    (should (equal "T" (cdr (assoc "title" header))))
+    (should-not (assoc "attr_org" header))
+    (should (string-prefix-p "#+attr_org:" body))
+    (should (string-match-p "#\\+begin_example" body))))
+
+(ert-deftest org-lark-test-normalize-attr-keyword-lines ()
+  "Inline / indented `#+attr_org:' is moved to its own column-0 line."
+  ;; Inlined onto a list bullet (pandoc's list reflow).
+  (should (equal "2. 有序列表 2-3\n#+attr_org: :emoji x\n#+begin_example"
+                 (org-lark--normalize-attr-keyword-lines
+                  "2. 有序列表 2-3 #+attr_org: :emoji x\n#+begin_example")))
+  ;; Indented on its own line.
+  (should (equal "#+attr_org: :width 33"
+                 (org-lark--normalize-attr-keyword-lines
+                  "   #+attr_org: :width 33"))))
+
+(ert-deftest org-lark-test-inline-emphasis-publish-round-trip ()
+  "Org emphasis (bold/italic/code/strike) converts to GFM via real pandoc."
+  (skip-unless (executable-find "pandoc"))
+  (let* ((org "Plain *bold*, /italic/, =code=, +strike+.")
+         (st (org-lark-test--pubst))
+         (md-with-markers (org-lark--rev-normalize org st))
+         (tmp (make-temp-file "ol-test" nil ".org")))
+    (with-temp-file tmp (insert md-with-markers))
+    (unwind-protect
+        (let* ((md (with-output-to-string
+                     (with-current-buffer standard-output
+                       (call-process "pandoc" nil t nil "-f" "org" "-t" "gfm"
+                                     "--wrap=none" tmp))))
+               (restored (org-lark--restore-placeholders md st)))
+          (should (string-match-p "\\*\\*bold\\*\\*" restored))
+          (should (string-match-p "\\*italic\\*" restored))
+          (should (string-match-p "`code`" restored))
+          (should (string-match-p "~~strike~~" restored)))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest org-lark-test-cjk-emphasis-read ()
+  "CJK-adjacent markdown bold inside <callout> becomes Org bold."
+  (skip-unless (executable-find "pandoc"))
+  (let* ((md (concat "<callout emoji=\"x\">\n"
+                     "**项目：**文本内容。\n"
+                     "</callout>"))
+         (st (make-org-lark--state
+              :output-file (expand-file-name "x.org" temporary-file-directory)
+              :asset-dir (expand-file-name "assets" temporary-file-directory)))
+         (out (org-lark--pipeline md '((title . "T") (doc_id . "d1"))
+                                  "u" st)))
+    (should (string-match-p ":lark-block callout" out))
+    (should (string-match-p "\\*项目：\\*" out))
+    (should-not (string-match-p "\\*\\*项目" out))))
+
+(ert-deftest org-lark-test-cjk-emphasis-publish ()
+  "CJK-adjacent Org emphasis converts cleanly to GFM bold/italic on publish."
+  (skip-unless (executable-find "pandoc"))
+  (let* ((org "*项目：*文本内容。\n\n用户 /斜体/ 字段。")
+         (st (org-lark-test--pubst))
+         (md-with-markers (org-lark--rev-normalize org st))
+         (tmp (make-temp-file "ol-test" nil ".org")))
+    (with-temp-file tmp (insert md-with-markers))
+    (unwind-protect
+        (let* ((md (with-output-to-string
+                     (with-current-buffer standard-output
+                       (call-process "pandoc" nil t nil "-f" "org" "-t" "gfm"
+                                     "--wrap=none" tmp))))
+               (restored (org-lark--restore-placeholders md st)))
+          (should (string-match-p "\\*\\*项目：\\*\\*" restored))
+          (should (string-match-p "\\*斜体\\*" restored))
+          ;; No pandoc-escaped asterisks should leak through.
+          (should-not (string-match-p "\\\\\\*" restored)))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest org-lark-test-callout-body-emphasis-round-trip ()
+  "Emphasis inside a callout body converts via pandoc (not held verbatim).
+A previous implementation wrapped the whole callout in one placeholder
+so the body bypassed pandoc; org `*X*' then went to Lark as italic,
+not bold.  This test pins the inline-body wrapping."
+  (skip-unless (executable-find "pandoc"))
+  (let* ((body (concat
+                "#+attr_org: :lark-block callout :emoji x\n"
+                "#+begin_example\n"
+                "*项目：*文本内容。\n"
+                "#+end_example\n"))
+         (st (org-lark-test--pubst))
+         (md-with-markers (org-lark--rev-normalize body st))
+         (tmp (make-temp-file "ol-test" nil ".org")))
+    (with-temp-file tmp (insert md-with-markers))
+    (unwind-protect
+        (let* ((md (with-output-to-string
+                     (with-current-buffer standard-output
+                       (call-process "pandoc" nil t nil "-f" "org" "-t" "gfm"
+                                     "--wrap=none" tmp))))
+               (restored (org-lark--restore-placeholders md st)))
+          (should (string-match-p "<callout[^>]*emoji=\"x\"" restored))
+          (should (string-match-p "\\*\\*项目：\\*\\*" restored))
+          (should (string-match-p "</callout>" restored))
+          ;; The body must NOT survive as a single italicized `*项目：*'.
+          (should-not (string-match-p "<callout[^>]*>\\(.\\|\n\\)*?\\*项目：\\*[^*]"
+                                      restored)))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest org-lark-test-publish-pandoc-placeholder-survives ()
+  "Placeholder tokens (`ORGLARKPH<N>Z') survive real pandoc untouched.
+A trailing `_' would be GFM-escaped to `\\_', breaking restoration."
+  (skip-unless (executable-find "pandoc"))
+  (let* ((org (concat
+               "#+attr_org: :lark-block callout :emoji x\n"
+               "#+begin_example\n"
+               "hello callout body\n"
+               "#+end_example\n"))
+         (st (org-lark-test--pubst))
+         (md-with-markers (org-lark--rev-normalize org st))
+         (tmp (make-temp-file "ol-test" nil ".org")))
+    (with-temp-file tmp (insert md-with-markers))
+    (unwind-protect
+        (let* ((md (with-output-to-string
+                     (with-current-buffer standard-output
+                       (call-process "pandoc" nil t nil "-f" "org" "-t" "gfm"
+                                     "--wrap=none" tmp))))
+               (restored (org-lark--restore-placeholders md st)))
+          (should (string-match-p "<callout[^>]*emoji=\"x\"" restored))
+          (should (string-match-p "hello callout body" restored)))
+      (ignore-errors (delete-file tmp)))))
 
 (provide 'org-lark-test)
 

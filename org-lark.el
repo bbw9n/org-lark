@@ -100,7 +100,7 @@ Overridden by a per-file =#+lark_parent:= keyword."
   "Mode passed to =lark-cli docs +update= when re-publishing.
 The default \"overwrite\" replaces the whole document body."
   :type '(choice (const "overwrite") (const "append")
-                 (const "replace_all") string))
+          (const "replace_all") string))
 
 (defcustom org-lark-confirm-overwrite-remote t
   "When non-nil, prompt before overwriting an existing remote doc.
@@ -981,7 +981,7 @@ before doing anything that might clobber match data."
   "Replace every <TAG ...>BODY</TAG> in TEXT.
 FUNC is called with (ATTRS BODY) strings."
   (let ((re (format "<%s\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</%s>"
-                     (regexp-quote tag) (regexp-quote tag))))
+                    (regexp-quote tag) (regexp-quote tag))))
     (org-lark--re-replace
      text re
      (lambda ()
@@ -1047,8 +1047,13 @@ Uses `make-process' with a deadline so Emacs stays responsive."
     (unwind-protect
         (progn
           (with-temp-file in-file (insert markdown))
+          ;; Pandoc's strict `gfm' / `commonmark' parsers refuse to recognize
+          ;; emphasis adjacent to CJK punctuation,
+          ;; leaving the raw markdown asterisks in the org output.  Pandoc's
+          ;; `markdown' dialect is a superset that handles this correctly
+          ;; while still accepting the GFM-flavoured input Lark emits.
           (org-lark--run org-lark-pandoc-program
-                         "-f" "gfm" "-t" "org" "--wrap=none" in-file))
+                         "-f" "markdown" "-t" "org" "--wrap=none" in-file))
       (delete-file in-file t))))
 
 ;;;; Async subprocess helpers ──────────────────────────────────────
@@ -1136,7 +1141,8 @@ Call CALLBACK with (ERR ORG)."
     (with-temp-file in-file (insert markdown))
     (org-lark--run-async
      org-lark-pandoc-program
-     (list "-f" "gfm" "-t" "org" "--wrap=none" in-file)
+     ;; See `org-lark--pandoc' for why we use `markdown' rather than `gfm'.
+     (list "-f" "markdown" "-t" "org" "--wrap=none" in-file)
      (lambda (err out)
        (ignore-errors (delete-file in-file t))
        (funcall callback err out)))))
@@ -1248,9 +1254,12 @@ Pandoc occasionally glues placeholder-restored `#+attr_org:' onto a
 preceding list-bullet line or leaves it indented; either form breaks
 the publish-side `^#+attr_org:' anchor and silently loses the
 `lark-block' sentinel on a round-trip."
-  ;; Inlined after non-newline text: "...bullet  #+attr_org: ..." \u2192 split.
+  ;; Inlined after non-blank text: "...bullet  #+attr_org: ..." \u2192 split.
+  ;; The leading char must be NON-whitespace so a line like `   #+attr_org:'
+  ;; doesn't get its first space split off into a phantom line \u2014 that case
+  ;; is handled by the unindent pass below.
   (setq text (replace-regexp-in-string
-              "\\([^\n]\\)[ \t]+#\\+attr_org:" "\\1\n#+attr_org:" text))
+              "\\([^[:space:]\n]\\)[ \t]+#\\+attr_org:" "\\1\n#+attr_org:" text))
   ;; Indented on its own line: "  #+attr_org: ..." \u2192 unindent.
   (setq text (replace-regexp-in-string
               "^[ \t]+#\\+attr_org:" "#+attr_org:" text))
@@ -1526,6 +1535,18 @@ ST collects placeholders.  Handles =lark_grid=, =lark_column=,
               (pairs (org-lark--rev-attr-pairs attr-line)))
          (org-lark--rev-dispatch-block name pairs body st))))))
 
+(defun org-lark--rev-wrap-inline-body (tag attrs body st)
+  "Emit <TAG ATTRS>BODY</TAG> with only the open/close tags placeholdered.
+The BODY is recursively processed for nested Lark blocks and then
+left inline so pandoc's org→gfm pass converts its emphasis,
+links, lists, etc.  Wrapping the body in a placeholder would hide
+it from pandoc and produce e.g. `<callout>*标题：*</callout>'
+(italic in Lark) instead of `<callout>**标题：**</callout>' (bold)."
+  (concat
+   (org-lark--rev-ph (format "<%s%s>\n" tag attrs) st)
+   (org-lark--rev-blocks-with-attrs body st)
+   (org-lark--rev-ph (format "\n</%s>" tag) st)))
+
 (defun org-lark--rev-dispatch-block (name pairs body st)
   "Return Lark-tag replacement for org block NAME with attribute PAIRS and BODY.
 ST is the publish state."
@@ -1572,37 +1593,30 @@ ST is the publish state."
             (others   (cl-remove-if (lambda (p) (string= (car p) "lark-block"))
                                     pairs)))
        (cond
-        ;; New: explicit `lark-block="callout"' sentinel.
+        ;; Callout (new sentinel form): place open/close tags in
+        ;; placeholders but leave the body inline so pandoc converts
+        ;; its emphasis (e.g. `*项目：*' → `**项目：**') correctly.
         ((equal sentinel "callout")
-         (org-lark--rev-ph
-          (format "<callout%s>\n%s\n</callout>"
-                  (org-lark--rev-render-attrs others)
-                  (string-trim (org-lark--rev-blocks-with-attrs body st)))
-          st))
-        ;; Legacy: pre-sentinel org files identified callouts heuristically
-        ;; by the presence of any callout-only attribute.
+         (org-lark--rev-wrap-inline-body
+          "callout" (org-lark--rev-render-attrs others) body st))
+        ;; Legacy callout: pre-sentinel org files identified callouts
+        ;; heuristically by the presence of any callout-only attribute.
         ((or (assoc "emoji" pairs) (assoc "background-color" pairs)
              (assoc "border-color" pairs))
-         (org-lark--rev-ph
-          (format "<callout%s>\n%s\n</callout>"
-                  (org-lark--rev-render-attrs pairs)
-                  (string-trim (org-lark--rev-blocks-with-attrs body st)))
-          st))
+         (org-lark--rev-wrap-inline-body
+          "callout" (org-lark--rev-render-attrs pairs) body st))
         (t
-         ;; Plain example → fall back to a fenced block.
+         ;; Plain example → fall back to a fenced block (verbatim).
          (org-lark--rev-ph
           (format "\n```\n%s\n```\n" body) st)))))
     ("quote"
      ;; Any `#+begin_quote' becomes a `<quote-container>'.  Strip the
      ;; sentinel (if present from a previous Lark export) so we don't
-     ;; round-trip it back to Lark.
+     ;; round-trip it back to Lark.  Body stays inline for pandoc.
      (let ((others (cl-remove-if (lambda (p) (string= (car p) "lark-block"))
                                  pairs)))
-       (org-lark--rev-ph
-        (format "<quote-container%s>\n%s\n</quote-container>"
-                (org-lark--rev-render-attrs others)
-                (string-trim (org-lark--rev-blocks-with-attrs body st)))
-        st)))
+       (org-lark--rev-wrap-inline-body
+        "quote-container" (org-lark--rev-render-attrs others) body st)))
     (_
      ;; Unknown block: leave the original text untouched (re-emit).
      (let ((attr (if pairs
@@ -1705,6 +1719,44 @@ asset is queued in ST for upload after the doc exists."
             (format "<sheet token=\"%s\"/>" (match-string 1)) st))))
   text)
 
+(defun org-lark--pad-cjk-emphasis (text)
+  "Pad spaces around Org emphasis runs that are adjacent to CJK characters.
+Pandoc's Org reader requires whitespace or specific punctuation on
+each side of an emphasis delimiter; CJK letters violate this rule,
+so `*标题：*' is left as literal `\\*标题：\\*文本'.  This
+preprocessor inserts a regular space at each delimiter boundary that
+abuts a CJK character — directly outside the run OR as the
+immediately-bordering body character — so pandoc's emphasis pass
+succeeds.  Idempotent: already-spaced runs are left alone."
+  (dolist (d '("*" "/" "+" "_" "="))
+    (let* ((q (regexp-quote d))
+           (cjk "[^[:ascii:][:space:]\n]")
+           (body-edge (concat "[^[:space:]" q "\n]"))
+           (body (concat body-edge
+                         "\\(?:[^" q "\n]*?" body-edge "\\)?"))
+           ;; Body whose last char is CJK (also matches a single CJK char).
+           (body-end-cjk (concat "\\(?:" body-edge "[^" q "\n]*?\\)?" cjk))
+           ;; Body whose first char is CJK (also matches a single CJK char).
+           (body-start-cjk (concat cjk "\\(?:[^" q "\n]*?" body-edge "\\)?")))
+      ;; 1. Closer immediately followed by CJK.
+      (setq text (replace-regexp-in-string
+                  (concat q "\\(" body "\\)" q "\\(" cjk "\\)")
+                  (concat d "\\1" d " \\2") text))
+      ;; 2. CJK letter immediately preceding opener.
+      (setq text (replace-regexp-in-string
+                  (concat "\\(" cjk "\\)" q "\\(" body "\\)" q)
+                  (concat "\\1 " d "\\2" d) text))
+      ;; 3. Body ends in CJK, closer followed by ASCII letter — pandoc
+      ;;    still rejects the run, so pad after closer.
+      (setq text (replace-regexp-in-string
+                  (concat q "\\(" body-end-cjk "\\)" q "\\([[:alpha:]]\\)")
+                  (concat d "\\1" d " \\2") text))
+      ;; 4. Mirror of 3 for the opener side.
+      (setq text (replace-regexp-in-string
+                  (concat "\\([[:alpha:]]\\)" q "\\(" body-start-cjk "\\)" q)
+                  (concat "\\1 " d "\\2" d) text))))
+  text)
+
 (defun org-lark--rev-normalize (text st)
   "Run all reverse-mapping passes over TEXT, accumulating in ST."
   (let ((t0 (float-time)))
@@ -1713,6 +1765,11 @@ asset is queued in ST for upload after the doc exists."
     ;; or indented, so the block-recognizer sees it.
     (setq text (org-lark--normalize-attr-keyword-lines text))
     (setq text (org-lark--rev-code-blocks text st))
+    ;; Pad CJK-adjacent emphasis so pandoc's gfm writer doesn't escape it.
+    ;; Runs after code-block protection (so verbatim content is untouched)
+    ;; but before block/image/link wrapping (so emphasis inside callout/
+    ;; quote bodies also gets padded for the markdown sent to Lark).
+    (setq text (org-lark--pad-cjk-emphasis text))
     (org-lark--log "  code blocks → %d placeholders"
                    (org-lark--pubstate-counter st))
     (setq text (org-lark--rev-blocks-with-attrs text st))
