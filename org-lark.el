@@ -442,14 +442,18 @@ ST is the mutable export state."
     ("text"
      (let ((parsed (org-lark--parse-attrs attrs)))
        (if (string= (alist-get "underline" parsed nil nil #'string=) "true")
-           (org-lark--ph (concat "_" body "_") st)
+           ;; `_X_' goes into a placeholder, so inline markdown inside
+           ;; X (e.g. `**bold**' or `` `code` '') would otherwise survive
+           ;; verbatim past pandoc; convert it to Org syntax here.
+           (org-lark--ph (concat "_" (org-lark--md-to-org-inline body) "_") st)
          body)))
     ("mention-doc"
      (let* ((parsed (org-lark--parse-attrs attrs))
             (token (alist-get "token" parsed nil nil #'string=))
             (type  (alist-get "type"  parsed nil nil #'string=))
             (label (if (string-empty-p (string-trim body))
-                       "Lark doc" (string-trim body))))
+                       "Lark doc"
+                     (org-lark--md-to-org-inline (string-trim body)))))
        (org-lark--ph
         (if token
             (format "[[lark-doc:%s][%s]] # type: %s" token label (or type ""))
@@ -471,6 +475,35 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
 
 ;;; Table
 
+(defun org-lark--md-to-org-inline (text)
+  "Convert inline markdown emphasis in TEXT to its Org equivalent.
+Used for content that bypasses pandoc — `<lark-td>' cells,
+`<agenda-item>' fields, `<okr-objective>' bodies, `<text>'
+underline content, `<mention-doc>' labels, and the
+table/grid flatten paths.  All of those embed their content
+directly into placeholders, so pandoc never sees it.
+
+Handles code, bold, italic, and strikethrough.  A SOH (`\\x01')
+marker buffers bold output so the italic pass doesn't mis-match
+the single asterisks that `**X**' → `*X*' leaves behind."
+  (when text
+    ;; `code` → =code= (do first so its body isn't re-processed).
+    (setq text (replace-regexp-in-string
+                "`\\([^`\n]+?\\)`" "=\\1=" text))
+    ;; **bold** → temporary SOH-wrapped marker.
+    (setq text (replace-regexp-in-string
+                "\\*\\*\\([^*\n]+?\\)\\*\\*" "\x01\\1\x01" text))
+    ;; *italic* → /italic/ (now safe: bold's asterisks are buffered).
+    (setq text (replace-regexp-in-string
+                "\\*\\([^*\n]+?\\)\\*" "/\\1/" text))
+    ;; Restore bold with Org's single-asterisk delimiter.
+    (setq text (replace-regexp-in-string
+                "\x01\\([^\x01\n]+?\\)\x01" "*\\1*" text))
+    ;; ~~strike~~ → +strike+.
+    (setq text (replace-regexp-in-string
+                "~~\\([^~\n]+?\\)~~" "+\\1+" text)))
+  text)
+
 (defun org-lark--tag-table (attrs body st)
   "Convert <lark-table> with ATTRS and BODY to an Org table placeholder in ST."
   (let* ((parsed (org-lark--parse-attrs attrs))
@@ -487,9 +520,13 @@ Org markers become placeholders; inner Markdown stays for Pandoc."
             (goto-char (point-min))
             (while (re-search-forward
                     "<lark-td\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-td>" nil t)
-              (let ((cell (replace-regexp-in-string
+              (let* ((raw (replace-regexp-in-string
                            "[\n\r]+[[:blank:]]*" " "
-                           (string-trim (match-string 2)))))
+                           (string-trim (match-string 2))))
+                     ;; Cell content sits in a placeholder verbatim, so
+                     ;; rewrite inline markdown (`` `code` '', `**bold**',
+                     ;; etc.) to Org syntax before insertion.
+                     (cell (org-lark--md-to-org-inline raw)))
                 (push (replace-regexp-in-string "|" "\\vert{}" cell t t) cells))))
           (push (nreverse cells) rows))))
     (let* ((rows (nreverse rows))
@@ -583,7 +620,10 @@ ST is the mutable export state."
       (buffer-string))))
 
 (defun org-lark--extract-table-rows (body)
-  "Parse table BODY into a list of rows, each a list of cell strings."
+  "Parse table BODY into a list of rows, each a list of cell strings.
+Cell content is run through `org-lark--md-to-org-inline' so inline
+markdown (e.g. `` `code` '', `**bold**') is rewritten to Org syntax —
+the flatten paths embed these cells into list items that bypass pandoc."
   (let (rows)
     (with-temp-buffer
       (insert body)
@@ -596,7 +636,9 @@ ST is the mutable export state."
             (goto-char (point-min))
             (while (re-search-forward
                     "<lark-td\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</lark-td>" nil t)
-              (push (string-trim (match-string 2)) cells)))
+              (push (org-lark--md-to-org-inline
+                     (string-trim (match-string 2)))
+                    cells)))
           (push (nreverse cells) rows))))
     (nreverse rows)))
 
@@ -620,7 +662,9 @@ ST is the mutable export state."
     (org-lark--ph (concat "\n" (string-join (nreverse lines) "\n") "\n") st)))
 
 (defun org-lark--grid-to-list (_attrs body st)
-  "Convert a <grid> with BODY containing tables to an Org list placeholder in ST."
+  "Convert a <grid> with BODY containing tables to an Org list placeholder in ST.
+Column body content is placed directly into the placeholder, so
+inline markdown is rewritten to Org syntax before assembly."
   (let ((columns nil) (col-idx 0))
     (with-temp-buffer
       (insert body)
@@ -629,7 +673,8 @@ ST is the mutable export state."
               "<column\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</column>" nil t)
         (cl-incf col-idx)
         (let* ((col-body (string-trim (match-string 2)))
-               (col-body (org-lark--inline-nested-table col-body)))
+               (col-body (org-lark--inline-nested-table col-body))
+               (col-body (org-lark--md-to-org-inline col-body)))
           (push (format "- Column %d\n%s" col-idx
                         (replace-regexp-in-string "^" "  " col-body))
                 columns))))
@@ -657,7 +702,10 @@ ST is the mutable export state."
     (buffer-string)))
 
 (defun org-lark--inline-nested-grid (text)
-  "Replace <grid> blocks in TEXT with column content joined by \" / \"."
+  "Replace <grid> blocks in TEXT with column content joined by \" / \".
+Used inside table cells where the result is embedded in an Org list
+item that bypasses pandoc, so column content is rewritten from
+markdown to Org syntax."
   (with-temp-buffer
     (insert text)
     (goto-char (point-min))
@@ -672,7 +720,9 @@ ST is the mutable export state."
             (goto-char (point-min))
             (while (re-search-forward
                     "<column\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</column>" nil t)
-              (push (string-trim (match-string 2)) columns)))
+              (push (org-lark--md-to-org-inline
+                     (string-trim (match-string 2)))
+                    columns)))
           (let ((content (string-join (nreverse columns) " / ")))
             (delete-region beg end)
             (goto-char beg)
@@ -682,7 +732,10 @@ ST is the mutable export state."
 ;;; Agenda
 
 (defun org-lark--tag-agenda (_attrs body st)
-  "Convert <agenda> BODY to Org heading tree placeholder in ST."
+  "Convert <agenda> BODY to Org heading tree placeholder in ST.
+Agenda item titles and contents are placed directly into the
+placeholder (they form Org headings), so any inline markdown is
+rewritten here — pandoc never sees this content."
   (let (items)
     (with-temp-buffer
       (insert body)
@@ -690,8 +743,11 @@ ST is the mutable export state."
       (while (re-search-forward
               "<agenda-item\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</agenda-item>" nil t)
         (let* ((item (match-string 2))
-               (title (org-lark--first-paired-body "agenda-item-title" item))
-               (content (org-lark--first-paired-body "agenda-item-content" item)))
+               (title (org-lark--md-to-org-inline
+                       (org-lark--first-paired-body "agenda-item-title" item)))
+               (content (org-lark--md-to-org-inline
+                         (org-lark--first-paired-body "agenda-item-content"
+                                                      item))))
           (push (concat "** " (string-trim (or title "Agenda item")) "\n"
                         (string-trim (or content "")) "\n")
                 items))))
@@ -702,7 +758,9 @@ ST is the mutable export state."
 ;;; OKR
 
 (defun org-lark--tag-okr (attrs body st)
-  "Convert <okr> with ATTRS and BODY to Org heading tree in ST."
+  "Convert <okr> with ATTRS and BODY to Org heading tree in ST.
+Objective bodies become Org heading text inside the placeholder
+returned here, so inline markdown is rewritten before placement."
   (let* ((parsed (org-lark--parse-attrs attrs))
          (period (or (alist-get "period-name-zh" parsed nil nil #'string=)
                      (alist-get "period-name-en" parsed nil nil #'string=)
@@ -716,9 +774,11 @@ ST is the mutable export state."
       (while (re-search-forward
               "<okr-objective\\([^>]*\\)>\\(\\(?:.\\|\n\\)*?\\)</okr-objective>"
               nil t)
-        (push (concat "** " (string-trim (match-string 2)) "\n:PROPERTIES:\n"
-                      (org-lark--props-from-attrs (match-string 1)) ":END:\n")
-              objectives)))
+        (let ((title (org-lark--md-to-org-inline
+                      (string-trim (match-string 2)))))
+          (push (concat "** " title "\n:PROPERTIES:\n"
+                        (org-lark--props-from-attrs (match-string 1)) ":END:\n")
+                objectives))))
     (org-lark--ph
      (concat header (string-join (nreverse objectives) "\n"))
      st)))

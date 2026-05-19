@@ -772,6 +772,35 @@ A trailing `_' would be GFM-escaped to `\\_', breaking restoration."
           (should (string-match-p "hello callout body" restored)))
       (ignore-errors (delete-file tmp)))))
 
+(ert-deftest org-lark-test-inline-md-conversion-bypass-sites ()
+  "Inline markdown converts to Org at every site that bypasses pandoc.
+These tags assemble content directly into placeholders, so pandoc
+never sees it; `org-lark--md-to-org-inline' is applied in each."
+  ;; <text underline> body.
+  (let ((out (org-lark-test--convert
+              "<text underline=\"true\">**bold** and `code`</text>")))
+    (should (string-match-p "_\\*bold\\* and =code=_" out)))
+  ;; <agenda-item-title> / <agenda-item-content>.
+  (let ((out (org-lark-test--convert
+              (concat "<agenda><agenda-item>"
+                      "<agenda-item-title>**Header**</agenda-item-title>"
+                      "<agenda-item-content>`feat/foo`</agenda-item-content>"
+                      "</agenda-item></agenda>"))))
+    ;; Markdown `**` collapses to Org `*` in the title.
+    (should-not (string-match-p "\\*\\*Header\\*\\*" out))
+    (should (string-match-p "\\*Header\\*" out))
+    (should (string-match-p "=feat/foo=" out)))
+  ;; <okr-objective> body.
+  (let ((out (org-lark-test--convert
+              (concat "<okr period-name-zh=\"Q1\">"
+                      "<okr-objective>**Core** Goal</okr-objective>"
+                      "</okr>"))))
+    (should (string-match-p "\\*Core\\* Goal" out)))
+  ;; <mention-doc> label.
+  (let ((out (org-lark-test--convert
+              "<mention-doc token=\"TKN\" type=\"docx\">**Important** Doc</mention-doc>")))
+    (should (string-match-p "\\*Important\\* Doc" out))))
+
 (provide 'org-lark-test)
 
 ;;; org-lark-test.el ends here
