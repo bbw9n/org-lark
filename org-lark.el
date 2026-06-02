@@ -2093,7 +2093,8 @@ TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
               (cond
                (err (funcall callback err nil))
                (t (funcall callback nil
-                           (or (alist-get 'url data)
+                           (or (alist-get 'doc_url data)
+                               (alist-get 'url data)
                                (org-lark--pubstate-doc-token st)))))))))))
      ;; Create path: create with markers, then upload media against the
      ;; freshly minted doc token, then a second +update swaps the
@@ -2108,7 +2109,8 @@ TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
            (let* ((new-token (or (alist-get 'document_id data)
                                  (alist-get 'doc_id data)
                                  (alist-get 'token data)))
-                  (url (alist-get 'url data)))
+                  (url (or (alist-get 'doc_url data)
+                           (alist-get 'url data))))
              (setf (org-lark--pubstate-doc-token st) new-token)
              (org-lark--write-header-back
               (org-lark--pubstate-org-file st) new-token (or url ""))
