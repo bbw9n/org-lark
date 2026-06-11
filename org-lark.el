@@ -282,20 +282,37 @@ the pre-async API)."
 
 ;;;; Fetch ──────────────────────────────────────────────────────────
 
+(defun org-lark--parse-fetch-data (data)
+  "Normalize lark-cli +fetch DATA into a `markdown'/`title'/`doc_id' alist.
+Handles both the current schema (data.document.content with the
+title embedded as a leading <title> tag, data.document.document_id)
+and the legacy flat schema (data.markdown / data.title / data.doc_id)."
+  (let* ((document (alist-get 'document data))
+         (content (or (alist-get 'content document)
+                      (alist-get 'markdown data)
+                      ""))
+         (title (alist-get 'title data)))
+    ;; Current CLI prefixes the content with <title>…</title>.
+    (when (string-match "\\`<title>\\(\\(?:.\\|\n\\)*?\\)</title>[ \t\n]*" content)
+      (unless title (setq title (match-string 1 content)))
+      (setq content (substring content (match-end 0))))
+    `((markdown . ,content)
+      (title    . ,title)
+      (doc_id   . ,(or (alist-get 'document_id document)
+                       (alist-get 'doc_id data))))))
+
 (defun org-lark-fetch (doc)
   "Fetch DOC from lark-cli.
 Return alist with keys `markdown', `title', `doc_id'."
   (let* ((json (org-lark--run-json
                 org-lark-cli-program
                 "docs" "+fetch" "--as" org-lark-identity
-                "--doc" doc "--format" "json"))
+                "--doc" doc "--doc-format" "markdown" "--format" "json"))
          (data (alist-get 'data json)))
     (unless (alist-get 'ok json)
       (user-error "lark-cli: %s"
                   (json-encode (or (alist-get 'error json) json))))
-    `((markdown . ,(or (alist-get 'markdown data) ""))
-      (title    . ,(alist-get 'title data))
-      (doc_id   . ,(alist-get 'doc_id data)))))
+    (org-lark--parse-fetch-data data)))
 
 ;;;; Conversion pipeline ───────────────────────────────────────────
 
@@ -1213,7 +1230,7 @@ Call CALLBACK with (ERR FETCHED-ALIST)."
   (org-lark--run-json-async
    org-lark-cli-program
    (list "docs" "+fetch" "--as" org-lark-identity
-         "--doc" doc "--format" "json")
+         "--doc" doc "--doc-format" "markdown" "--format" "json")
    (lambda (err json)
      (cond
       (err (funcall callback err nil))
@@ -1222,11 +1239,8 @@ Call CALLBACK with (ERR FETCHED-ALIST)."
                 (format "lark-cli: %s"
                         (json-encode (or (alist-get 'error json) json)))
                 nil))
-      (t (let ((data (alist-get 'data json)))
-           (funcall callback nil
-                    `((markdown . ,(or (alist-get 'markdown data) ""))
-                      (title    . ,(alist-get 'title data))
-                      (doc_id   . ,(alist-get 'doc_id data))))))))))
+      (t (funcall callback nil
+                  (org-lark--parse-fetch-data (alist-get 'data json))))))))
 
 (defun org-lark--download-media-async (token type st callback)
   "Async variant of `org-lark--download-media'.

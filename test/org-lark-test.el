@@ -121,6 +121,19 @@ without spawning a real Pandoc process."
       (should (equal (alist-get 'title fetched) "My Doc"))
       (should (equal (alist-get 'doc_id fetched) "doc1")))))
 
+(ert-deftest org-lark-test-fetch-document-schema ()
+  "Current lark-cli wraps content in data.document with a <title> prefix."
+  (cl-letf (((symbol-function 'org-lark--run-json)
+             (lambda (_program &rest _args)
+               '((ok . t)
+                 (data . ((document . ((document_id . "doc1")
+                                       (revision_id . 12)
+                                       (content . "<title>My Doc</title>\n\n# Hello")))))))))
+    (let ((fetched (org-lark-fetch "doc")))
+      (should (equal (alist-get 'markdown fetched) "# Hello"))
+      (should (equal (alist-get 'title fetched) "My Doc"))
+      (should (equal (alist-get 'doc_id fetched) "doc1")))))
+
 (ert-deftest org-lark-test-noninteractive-export-does-not-open-file ()
   (let ((opened nil)
         (output (expand-file-name "org-lark-export-test.org"
