@@ -134,6 +134,17 @@ without spawning a real Pandoc process."
       (should (equal (alist-get 'title fetched) "My Doc"))
       (should (equal (alist-get 'doc_id fetched) "doc1")))))
 
+(ert-deftest org-lark-test-fetch-heading-title ()
+  "Markdown fetch may render the doc title as a leading # heading."
+  (cl-letf (((symbol-function 'org-lark--run-json)
+             (lambda (_program &rest _args)
+               '((ok . t)
+                 (data . ((document . ((document_id . "doc1")
+                                       (content . "# My Doc\n\nBody text.")))))))))
+    (let ((fetched (org-lark-fetch "doc")))
+      (should (equal (alist-get 'markdown fetched) "Body text."))
+      (should (equal (alist-get 'title fetched) "My Doc")))))
+
 (ert-deftest org-lark-test-noninteractive-export-does-not-open-file ()
   (let ((opened nil)
         (output (expand-file-name "org-lark-export-test.org"
@@ -555,8 +566,71 @@ fallback comment instead of a file link."
                                     (buffer-string)))))
       (ignore-errors (delete-file org-file t)))))
 
+(ert-deftest org-lark-test-docs-create-v2-args ()
+  "+create uses v2 flags and prepends the title as a # heading."
+  (let (saw-args saw-content got-data)
+    (cl-letf (((symbol-function 'org-lark--run-json-async)
+               (lambda (_program args cb)
+                 (setq saw-args args)
+                 (let ((file (substring (cadr (member "--content" args)) 1)))
+                   (setq saw-content
+                         (with-temp-buffer
+                           (insert-file-contents (expand-file-name file))
+                           (buffer-string))))
+                 (funcall cb nil
+                          '((ok . t)
+                            (data . ((document . ((document_id . "d1")
+                                                  (url . "https://lark/d1"))))))))))
+      (org-lark--docs-create-async
+       "My Doc" "Body." '(:folder-token "FLD1")
+       (lambda (_err data) (setq got-data data))))
+    (should (member "--doc-format" saw-args))
+    (should (member "markdown" saw-args))
+    (should (equal "FLD1" (cadr (member "--parent-token" saw-args))))
+    (should-not (member "--title" saw-args))
+    (should (equal "# My Doc\n\nBody." saw-content))
+    (should (equal "d1" (alist-get 'document_id got-data)))
+    (should (equal "https://lark/d1" (alist-get 'url got-data)))))
+
+(ert-deftest org-lark-test-docs-create-wiki-node-parent ()
+  "wiki:SPACE/NODE maps the node token to --parent-token; space-only errors."
+  (let (saw-args got-err)
+    (cl-letf (((symbol-function 'org-lark--run-json-async)
+               (lambda (_program args cb)
+                 (setq saw-args args)
+                 (funcall cb nil '((ok . t) (data . ((document))))))))
+      (org-lark--docs-create-async
+       "T" "B" (org-lark--parse-parent "wiki:SPACE_X/NODE_Y") #'ignore)
+      (should (equal "NODE_Y" (cadr (member "--parent-token" saw-args))))
+      (org-lark--docs-create-async
+       "T" "B" (org-lark--parse-parent "wiki:SPACE_X")
+       (lambda (err _data) (setq got-err err)))
+      (should (stringp got-err)))))
+
+(ert-deftest org-lark-test-docs-update-v2-args ()
+  "+update uses --command/--content and renames via the leading heading."
+  (let (saw-args saw-content)
+    (cl-letf (((symbol-function 'org-lark--run-json-async)
+               (lambda (_program args cb)
+                 (setq saw-args args)
+                 (let ((file (substring (cadr (member "--content" args)) 1)))
+                   (setq saw-content
+                         (with-temp-buffer
+                           (insert-file-contents (expand-file-name file))
+                           (buffer-string))))
+                 (funcall cb nil
+                          '((ok . t)
+                            (data . ((document . ((document_id . "d1"))))))))))
+      (org-lark--docs-update-async "EXISTING" "New Title" "Body." #'ignore))
+    (should (equal "EXISTING" (cadr (member "--doc" saw-args))))
+    (should (equal "overwrite" (cadr (member "--command" saw-args))))
+    (should (equal "markdown" (cadr (member "--doc-format" saw-args))))
+    (should-not (member "--new-title" saw-args))
+    (should-not (member "--mode" saw-args))
+    (should (equal "# New Title\n\nBody." saw-content))))
+
 (ert-deftest org-lark-test-publish-update-routes-to-update ()
-  "#+lark_doc_id header → docs +update with --new-title."
+  "#+lark_doc_id header → docs +update with the new title."
   (let* ((org-file (make-temp-file "org-lark-pub-" nil ".org"))
          (saw-create nil) (saw-update nil) (got-url nil))
     (unwind-protect

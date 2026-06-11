@@ -97,10 +97,10 @@ Overridden by a per-file =#+lark_parent:= keyword."
   :type '(choice (const nil) string))
 
 (defcustom org-lark-publish-update-mode "overwrite"
-  "Mode passed to =lark-cli docs +update= when re-publishing.
-The default \"overwrite\" replaces the whole document body."
-  :type '(choice (const "overwrite") (const "append")
-          (const "replace_all") string))
+  "Command passed to =lark-cli docs +update= when re-publishing.
+The default \"overwrite\" replaces the whole document body;
+\"append\" adds to the document end instead."
+  :type '(choice (const "overwrite") (const "append") string))
 
 (defcustom org-lark-confirm-overwrite-remote t
   "When non-nil, prompt before overwriting an existing remote doc.
@@ -292,9 +292,15 @@ and the legacy flat schema (data.markdown / data.title / data.doc_id)."
                       (alist-get 'markdown data)
                       ""))
          (title (alist-get 'title data)))
-    ;; Current CLI prefixes the content with <title>…</title>.
-    (when (string-match "\\`<title>\\(\\(?:.\\|\n\\)*?\\)</title>[ \t\n]*" content)
-      (unless title (setq title (match-string 1 content)))
+    ;; The current CLI (data.document schema) prefixes the content with
+    ;; the document title, either as a <title> tag (when the first body
+    ;; block is a heading) or as a leading "# …" line.
+    (when (and document
+               (string-match
+                "\\`\\(?:<title>\\(\\(?:.\\|\n\\)*?\\)</title>\\|# \\(.*\\)\\)[ \t\n]*"
+                content))
+      (unless title
+        (setq title (or (match-string 1 content) (match-string 2 content))))
       (setq content (substring content (match-end 0))))
     `((markdown . ,content)
       (title    . ,title)
@@ -1979,56 +1985,76 @@ DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
 
 ;;; lark-cli docs +create / +update wrappers
 
+(defun org-lark--md-with-title (title markdown)
+  "Prepend TITLE as a leading # heading of MARKDOWN.
+lark-cli v2 has no --title/--new-title flag; the document title is
+extracted from the leading Markdown heading instead."
+  (if (and title (not (string-empty-p title)))
+      (concat "# " title "\n\n" markdown)
+    markdown))
+
+(defun org-lark--docs-data (json)
+  "Extract the document alist from a v2 +create/+update JSON response.
+Falls back to the flat legacy `data' alist."
+  (let ((data (alist-get 'data json)))
+    (or (alist-get 'document data) data)))
+
 (defun org-lark--docs-create-async (title markdown parent callback)
   "Async wrapper for =docs +create=.  Calls CALLBACK with (ERR DATA-ALIST).
 PARENT is the parsed plist from `org-lark--parse-parent' or nil."
-  ;; lark-cli requires =--markdown @file= to be a relative path inside
-  ;; the subprocess's cwd, so bind `default-directory' to the temp dir
-  ;; and pass only the basename.
-  (let* ((md-file (make-temp-file "org-lark-pub-" nil ".md"))
-         (default-directory (file-name-directory md-file))
-         (md-rel (file-name-nondirectory md-file)))
-    (with-temp-file md-file (insert markdown))
-    (let ((args (append
-                 (list "docs" "+create"
-                       "--as" org-lark-identity
-                       "--title" title
-                       "--markdown" (concat "@" md-rel))
-                 (when (plist-get parent :folder-token)
-                   (list "--folder-token" (plist-get parent :folder-token)))
-                 (when (plist-get parent :wiki-space)
-                   (list "--wiki-space" (plist-get parent :wiki-space)))
-                 (when (plist-get parent :wiki-node)
-                   (list "--wiki-node" (plist-get parent :wiki-node))))))
-      (org-lark--run-json-async
-       org-lark-cli-program args
-       (lambda (err json)
-         (ignore-errors (delete-file md-file t))
-         (cond
-          (err (funcall callback err nil))
-          ((not (alist-get 'ok json))
-           (funcall callback
-                    (format "docs +create: %s"
-                            (json-encode
-                             (or (alist-get 'error json) json)))
-                    nil))
-          (t (funcall callback nil (alist-get 'data json)))))))))
+  (if (and (plist-get parent :wiki-space)
+           (not (plist-get parent :wiki-node)))
+      (funcall callback
+               "lark-cli v2 takes a wiki node token as parent; use \"wiki:SPACE/NODE\""
+               nil)
+    ;; lark-cli requires =--content @file= to be a relative path inside
+    ;; the subprocess's cwd, so bind `default-directory' to the temp dir
+    ;; and pass only the basename.
+    (let* ((md-file (make-temp-file "org-lark-pub-" nil ".md"))
+           (default-directory (file-name-directory md-file))
+           (md-rel (file-name-nondirectory md-file)))
+      (with-temp-file md-file
+        (insert (org-lark--md-with-title title markdown)))
+      (let ((args (append
+                   (list "docs" "+create"
+                         "--as" org-lark-identity
+                         "--doc-format" "markdown"
+                         "--content" (concat "@" md-rel))
+                   (let ((tok (or (plist-get parent :wiki-node)
+                                  (plist-get parent :folder-token))))
+                     (when tok (list "--parent-token" tok))))))
+        (org-lark--run-json-async
+         org-lark-cli-program args
+         (lambda (err json)
+           (ignore-errors (delete-file md-file t))
+           (cond
+            (err (funcall callback err nil))
+            ((not (alist-get 'ok json))
+             (funcall callback
+                      (format "docs +create: %s"
+                              (json-encode
+                               (or (alist-get 'error json) json)))
+                      nil))
+            (t (funcall callback nil (org-lark--docs-data json))))))))))
 
 (defun org-lark--docs-update-async (doc-token title markdown callback)
   "Async wrapper for =docs +update= in overwrite mode.
-TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
+TITLE is non-nil to also rename the doc (overwrite only, via the
+leading Markdown heading).  Calls CALLBACK (ERR DATA)."
   ;; See `org-lark--docs-create-async' for why we rebind `default-directory'.
   (let* ((md-file (make-temp-file "org-lark-pub-" nil ".md"))
          (default-directory (file-name-directory md-file))
          (md-rel (file-name-nondirectory md-file)))
-    (with-temp-file md-file (insert markdown))
-    (let ((args (append
-                 (list "docs" "+update"
-                       "--as" org-lark-identity
-                       "--doc" doc-token
-                       "--mode" org-lark-publish-update-mode
-                       "--markdown" (concat "@" md-rel))
-                 (when title (list "--new-title" title)))))
+    (with-temp-file md-file
+      (insert (if (equal org-lark-publish-update-mode "overwrite")
+                  (org-lark--md-with-title title markdown)
+                markdown)))
+    (let ((args (list "docs" "+update"
+                      "--as" org-lark-identity
+                      "--doc" doc-token
+                      "--command" org-lark-publish-update-mode
+                      "--doc-format" "markdown"
+                      "--content" (concat "@" md-rel))))
       (org-lark--run-json-async
        org-lark-cli-program args
        (lambda (err json)
@@ -2041,7 +2067,7 @@ TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
                             (json-encode
                              (or (alist-get 'error json) json)))
                     nil))
-          (t (funcall callback nil (alist-get 'data json)))))))))
+          (t (funcall callback nil (org-lark--docs-data json)))))))))
 
 ;;; Header write-back (for newly-created docs)
 
@@ -2141,7 +2167,7 @@ TITLE is non-nil to also rename the doc.  Calls CALLBACK (ERR DATA)."
                   (let ((md (org-lark--substitute-media-tokens
                              md st results)))
                     (org-lark--docs-update-async
-                     new-token nil md
+                     new-token title md
                      (lambda (err2 _data2)
                        (cond
                         (err2 (funcall callback err2 nil))
