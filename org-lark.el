@@ -107,6 +107,11 @@ The default \"overwrite\" replaces the whole document body;
 Skipped for non-interactive callers."
   :type 'boolean)
 
+(defcustom org-lark-publish-open-url t
+  "When non-nil, `org-lark-publish' opens the document in the
+default browser after a successful publish."
+  :type 'boolean)
+
 (defcustom org-lark-media-cache-file
   (locate-user-emacs-file "org-lark-media.eld")
   "Where to persist the media upload cache.
@@ -1986,11 +1991,19 @@ DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
 ;;; lark-cli docs +create / +update wrappers
 
 (defun org-lark--md-with-title (title markdown)
-  "Prepend TITLE as a leading # heading of MARKDOWN.
-lark-cli v2 has no --title/--new-title flag; the document title is
-extracted from the leading Markdown heading instead."
+  "Prepend TITLE as a leading <title> tag of MARKDOWN.
+lark-cli v2 has no --title/--new-title flag; the document title
+comes from the content.  A leading \"# \" heading is only promoted
+to the title when the body has no other h1, so use the explicit
+<title> tag, which works unconditionally in markdown mode too."
   (if (and title (not (string-empty-p title)))
-      (concat "# " title "\n\n" markdown)
+      (let ((escaped (replace-regexp-in-string
+                      "[&<>]"
+                      (lambda (c) (cdr (assoc c '(("&" . "&amp;")
+                                                  ("<" . "&lt;")
+                                                  (">" . "&gt;")))))
+                      title)))
+        (concat "<title>" escaped "</title>\n\n" markdown))
     markdown))
 
 (defun org-lark--docs-data (json)
@@ -2236,7 +2249,13 @@ Runs asynchronously; the buffer stays responsive throughout."
      (lambda (err url)
        (cond
         (err (message "org-lark: publish failed: %s" err))
-        (t (message "org-lark: published → %s" (or url "(no url)"))))))))
+        (t
+         (message "org-lark: published → %s" (or url "(no url)"))
+         ;; URL falls back to the bare doc token when lark-cli returns
+         ;; no link; only open real links.
+         (when (and org-lark-publish-open-url url
+                    (string-match-p "\\`https?://" url))
+           (browse-url url))))))))
 
 ;;;###autoload
 (defun org-lark-publish-buffer ()

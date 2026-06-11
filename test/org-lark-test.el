@@ -588,7 +588,7 @@ fallback comment instead of a file link."
     (should (member "markdown" saw-args))
     (should (equal "FLD1" (cadr (member "--parent-token" saw-args))))
     (should-not (member "--title" saw-args))
-    (should (equal "# My Doc\n\nBody." saw-content))
+    (should (equal "<title>My Doc</title>\n\nBody." saw-content))
     (should (equal "d1" (alist-get 'document_id got-data)))
     (should (equal "https://lark/d1" (alist-get 'url got-data)))))
 
@@ -627,7 +627,31 @@ fallback comment instead of a file link."
     (should (equal "markdown" (cadr (member "--doc-format" saw-args))))
     (should-not (member "--new-title" saw-args))
     (should-not (member "--mode" saw-args))
-    (should (equal "# New Title\n\nBody." saw-content))))
+    (should (equal "<title>New Title</title>\n\nBody." saw-content))))
+
+(ert-deftest org-lark-test-publish-opens-url ()
+  "Successful publish opens the doc URL in the browser; bare tokens don't."
+  (let* ((org-file (make-temp-file "org-lark-pub-" nil ".org"))
+         (opened nil)
+         (result-url "https://lark/D1"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-lark-publish-async)
+                   (lambda (_file cb) (funcall cb nil result-url)))
+                  ((symbol-function 'browse-url)
+                   (lambda (url &rest _) (setq opened url))))
+          (with-temp-file org-file (insert "#+title: T\n\nBody.\n"))
+          (let ((org-lark-publish-open-url t))
+            (org-lark-publish org-file)
+            (should (equal "https://lark/D1" opened))
+            ;; Token fallback (no URL) must not open a browser.
+            (setq opened nil result-url "D1TOKEN")
+            (org-lark-publish org-file)
+            (should-not opened))
+          (let ((org-lark-publish-open-url nil))
+            (setq opened nil result-url "https://lark/D1")
+            (org-lark-publish org-file)
+            (should-not opened)))
+      (ignore-errors (delete-file org-file t)))))
 
 (ert-deftest org-lark-test-publish-update-routes-to-update ()
   "#+lark_doc_id header → docs +update with the new title."
