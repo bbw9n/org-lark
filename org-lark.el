@@ -1713,14 +1713,50 @@ ST is the publish state."
                    "")))
        (format "%s#+begin_%s\n%s\n#+end_%s" attr name body name)))))
 
-(defun org-lark--media-img-tag (token attrs)
+(defun org-lark--image-dimensions (path)
+  "Return (WIDTH . HEIGHT) in pixels for image PATH, or nil.
+Uses Emacs's own image support via `image-size', so it understands
+every format Emacs was built with (PNG, JPEG, GIF, WebP, …).
+`image-scaling-factor' is pinned to 1.0 to get the file's true pixel
+size rather than a display-scaled one.  Returns nil when the size
+cannot be determined — e.g. on a non-graphical display or for an
+unsupported format — in which case the image is emitted without
+explicit dimensions."
+  (ignore-errors
+    (when (display-images-p)
+      (let* ((image-scaling-factor 1.0)
+             (img (create-image (expand-file-name path)))
+             (size (image-size img t)))
+        (cons (round (car size)) (round (cdr size)))))))
+
+(defun org-lark--img-attrs-with-dimensions (attrs path)
+  "Return ATTRS with width/height filled in from PATH when absent.
+ATTRS is an alist; PATH is a local image file (may be nil).  If ATTRS
+already carries either dimension, or PATH is unreadable or not a
+recognised raster format, ATTRS is returned unchanged.  Without this
+the image block has no intrinsic size and Lark renders it as a default
+square instead of the file's true aspect ratio."
+  (if (or (assoc "width" attrs) (assoc "height" attrs)
+          (null path) (not (file-readable-p path)))
+      attrs
+    (let ((dim (org-lark--image-dimensions path)))
+      (if dim
+          (append attrs
+                  (list (cons "width" (number-to-string (car dim)))
+                        (cons "height" (number-to-string (cdr dim)))))
+        attrs))))
+
+(defun org-lark--media-img-tag (token attrs &optional path)
   "Render a v2 <img> tag for media TOKEN, carrying extra ATTRS.
 ATTRS is an alist of (KEY . VALUE) pairs; token/src/href keys are
 dropped in favour of TOKEN.  lark-cli v2 represents an image block
 referencing an uploaded media as <img src=…/> (the v1 <image
-token=…/> form is silently dropped)."
-  (format "<img src=\"%s\"%s/>" token
-          (org-lark--rev-render-attrs attrs '("token" "src" "href"))))
+token=…/> form is silently dropped).  When ATTRS lacks width/height
+and PATH is a readable PNG/JPEG/GIF, the natural pixel dimensions are
+added so the image keeps its aspect ratio instead of rendering square."
+  (let ((attrs (org-lark--img-attrs-with-dimensions attrs path)))
+    (format "<img src=\"%s\"%s/>" token
+            (org-lark--rev-render-attrs attrs '("token" "src" "href")))))
 
 (defun org-lark--media-file-tag (token name)
   "Render a v2 <source> file-attachment tag for media TOKEN named NAME.
@@ -1759,7 +1795,7 @@ asset is queued in ST for upload after the doc exists."
          (org-lark--rev-ph
           (if file-p
               (org-lark--media-file-tag token (or label ""))
-            (org-lark--media-img-tag token pairs))
+            (org-lark--media-img-tag token pairs abs))
           st))
         ;; Local asset: queue for upload, emit a stable marker token
         ;; that we substitute inline once a token is known.  The
@@ -2031,7 +2067,8 @@ DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
                  ((eq kind 'file)
                   (org-lark--media-file-tag token name))
                  (t
-                  (org-lark--media-img-tag token attrs))))
+                  (org-lark--media-img-tag
+                   token attrs (plist-get plist :abs)))))
                (t
                 (org-lark--log "media failed for %s: %s" rel err)
                 (format "[%s](%s)" (or name rel) rel)))))
