@@ -500,7 +500,7 @@ fallback comment instead of a file link."
                "#+attr_org: :token TKN :width 640\n"
                "[[file:assets/foo.png]]"))
          (out (org-lark-test--reverse org)))
-    (should (string-match-p "<image token=\"TKN\"" out))
+    (should (string-match-p "<img src=\"TKN\"" out))
     (should (string-match-p "width=\"640\"" out))
     (should-not (string-match-p "ORGLARKMEDIA" out))))
 
@@ -699,7 +699,7 @@ fallback comment instead of a file link."
           ;; Pre-seed cache for the file so reuse short-circuits upload.
           (let ((org-lark--media-cache-loaded t)
                 (org-lark--media-cache nil))
-            (org-lark--media-cache-put png "CACHED_TOK")
+            (org-lark--media-cache-put "D1" png "CACHED_TOK")
             (cl-letf
                 (((symbol-function 'org-lark--pandoc-org-to-md-async)
                   (lambda (org cb) (funcall cb nil org)))
@@ -709,7 +709,7 @@ fallback comment instead of a file link."
                  ((symbol-function 'org-lark--docs-update-async)
                   (lambda (_d _t md cb)
                     (should (string-match-p
-                             "<image token=\"CACHED_TOK\"" md))
+                             "<img src=\"CACHED_TOK\"" md))
                     (funcall cb nil '((url . "u"))))))
               (org-lark-publish-async
                org-file (lambda (_e u) (setq got-url u)))

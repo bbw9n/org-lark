@@ -1461,20 +1461,23 @@ the original Lark tag without relying on attribute heuristics."
         (secure-hash 'sha256 (current-buffer)))
     (error nil)))
 
-(defun org-lark--media-cache-get (abs-path)
-  "Return cached token for ABS-PATH, or nil."
+(defun org-lark--media-cache-get (doc-token abs-path)
+  "Return cached token for ABS-PATH within DOC-TOKEN, or nil.
+The key includes DOC-TOKEN because lark-cli v2 binds a media token to
+the document it was uploaded against; a token is not reusable across
+documents."
   (org-lark--media-cache-load)
   (let ((sha (org-lark--file-sha256 abs-path)))
     (when sha
-      (cdr (assoc (cons abs-path sha) org-lark--media-cache)))))
+      (cdr (assoc (list doc-token abs-path sha) org-lark--media-cache)))))
 
-(defun org-lark--media-cache-put (abs-path token)
-  "Store TOKEN for ABS-PATH in the persistent media cache."
-  (when (and abs-path token)
+(defun org-lark--media-cache-put (doc-token abs-path token)
+  "Store TOKEN for ABS-PATH within DOC-TOKEN in the persistent media cache."
+  (when (and doc-token abs-path token)
     (let ((sha (org-lark--file-sha256 abs-path)))
       (when sha
         (org-lark--media-cache-load)
-        (let ((key (cons abs-path sha)))
+        (let ((key (list doc-token abs-path sha)))
           (setq org-lark--media-cache
                 (cons (cons key token)
                       (cl-remove-if (lambda (e) (equal (car e) key))
@@ -1710,10 +1713,25 @@ ST is the publish state."
                    "")))
        (format "%s#+begin_%s\n%s\n#+end_%s" attr name body name)))))
 
+(defun org-lark--media-img-tag (token attrs)
+  "Render a v2 <img> tag for media TOKEN, carrying extra ATTRS.
+ATTRS is an alist of (KEY . VALUE) pairs; token/src/href keys are
+dropped in favour of TOKEN.  lark-cli v2 represents an image block
+referencing an uploaded media as <img src=…/> (the v1 <image
+token=…/> form is silently dropped)."
+  (format "<img src=\"%s\"%s/>" token
+          (org-lark--rev-render-attrs attrs '("token" "src" "href"))))
+
+(defun org-lark--media-file-tag (token name)
+  "Render a v2 <source> file-attachment tag for media TOKEN named NAME.
+lark-cli v2 represents a file block referencing an uploaded media as
+<source token=…/> (the v1 <file token=…/> form is silently dropped)."
+  (format "<source token=\"%s\" name=\"%s\"/>" token (or name "")))
+
 (defun org-lark--rev-images (text st)
   "Replace =[[file:..]]= references in TEXT with media markers.
 Honours a preceding =#+attr_org: :token TOK= line: if present the
-token is reused directly (emits <image token=…/>).  Otherwise the
+token is reused directly (emits <img src=…/>).  Otherwise the
 asset is queued in ST for upload after the doc exists."
   (org-lark--re-replace
    text
@@ -1740,11 +1758,8 @@ asset is queued in ST for upload after the doc exists."
         (token
          (org-lark--rev-ph
           (if file-p
-              (format "<file token=\"%s\" name=\"%s\"/>"
-                      token (or label ""))
-            (format "<image token=\"%s\"%s/>"
-                    token
-                    (org-lark--rev-render-attrs pairs '("token"))))
+              (org-lark--media-file-tag token (or label ""))
+            (org-lark--media-img-tag token pairs))
           st))
         ;; Local asset: queue for upload, emit a stable marker token
         ;; that we substitute inline once a token is known.  The
@@ -1890,49 +1905,87 @@ succeeds.  Idempotent: already-spaced runs are left alone."
 (defun org-lark--upload-media-async (job doc-token callback)
   "Upload a single media JOB to the doc identified by DOC-TOKEN.
 Calls CALLBACK with (ERR TOKEN).  Uses the on-disk media cache to
-short-circuit unchanged files."
+short-circuit unchanged files.
+
+lark-cli v2 has no standalone media upload that yields a reusable
+token: =docs +media-upload= requires the --parent-node block it binds
+to.  Instead we drive =docs +media-insert=, which creates a scratch
+block, uploads the file into it and returns its file_token.  The
+scratch block is then deleted; the token stays valid for DOC-TOKEN and
+is re-bound when the body is written with <img src=…/> / <source
+token=…/>."
   (let* ((abs (plist-get (cdr job) :abs))
-         (cached (org-lark--media-cache-get abs)))
+         (cached (org-lark--media-cache-get doc-token abs)))
     (cond
      (cached
       (org-lark--log "media cache hit %s → %s" abs cached)
       (funcall callback nil cached))
      (t
       (let* ((kind (plist-get (cdr job) :kind))
-             (parent-type (if (eq kind 'file) "docx_file" "docx_image"))
-             (args (list "docs" "+media-upload"
+             (type (if (eq kind 'file) "file" "image"))
+             ;; +media-insert requires --file to be a relative path
+             ;; inside the subprocess cwd, so bind `default-directory'
+             ;; to the file's dir and pass only the basename.
+             (default-directory (file-name-directory abs))
+             (file-rel (file-name-nondirectory abs))
+             (args (list "docs" "+media-insert"
                          "--as" org-lark-identity
-                         "--doc-id" doc-token
-                         "--parent-type" parent-type
-                         "--file" abs)))
-        (org-lark--log "media upload %s (%s)" abs parent-type)
+                         "--doc" doc-token
+                         "--type" type
+                         "--file" file-rel)))
+        (org-lark--log "media insert %s (%s)" abs type)
         (org-lark--run-json-async
          org-lark-cli-program args
          (lambda (err json)
            (org-lark--upload-media-handle-result
-            err json abs callback))))))))
+            err json abs doc-token callback))))))))
 
-(defun org-lark--upload-media-handle-result (err json abs callback)
-  "Process the lark-cli media-upload response and call CALLBACK (ERR TOKEN).
+(defun org-lark--upload-media-handle-result (err json abs doc-token callback)
+  "Process the lark-cli media-insert response and call CALLBACK (ERR TOKEN).
 ABS is the local file path; on success it gets cached against the
-returned token."
+returned token (keyed by DOC-TOKEN, since v2 binds media tokens to a
+document).  Any scratch block created by +media-insert is deleted
+before CALLBACK runs."
   (cond
    (err (funcall callback err nil))
    ((not (alist-get 'ok json))
     (funcall callback
-             (format "media-upload: %s"
+             (format "media-insert: %s"
                      (json-encode (or (alist-get 'error json) json)))
              nil))
    (t (let* ((data (alist-get 'data json))
              (token (or (alist-get 'file_token data)
                         (alist-get 'token data)
-                        (alist-get 'media_token data))))
+                        (alist-get 'media_token data)))
+             (block-id (alist-get 'block_id data)))
         (cond
-         (token (org-lark--media-cache-put abs token)
-                (funcall callback nil token))
+         (token
+          (org-lark--media-cache-put doc-token abs token)
+          (org-lark--delete-scratch-block-async
+           doc-token block-id
+           (lambda () (funcall callback nil token))))
          (t (funcall callback
-                     "media-upload: no token in response"
+                     "media-insert: no token in response"
                      nil)))))))
+
+(defun org-lark--delete-scratch-block-async (doc-token block-id done)
+  "Delete scratch BLOCK-ID from DOC-TOKEN, then call DONE with no args.
+A delete failure is logged but not fatal — the body write re-creates
+the media block via its token, and an orphan scratch block (only when
+the update mode is not =overwrite=) is harmless."
+  (if (or (null doc-token) (null block-id))
+      (funcall done)
+    (org-lark--run-json-async
+     org-lark-cli-program
+     (list "docs" "+update"
+           "--as" org-lark-identity
+           "--doc" doc-token
+           "--command" "block_delete"
+           "--block-id" block-id)
+     (lambda (err _json)
+       (when err
+         (org-lark--log "scratch block delete failed (%s): %s" block-id err))
+       (funcall done)))))
 
 (defun org-lark--upload-all-media-async (st doc-token done-callback)
   "Upload every queued job in ST against DOC-TOKEN, then call DONE-CALLBACK.
@@ -1976,10 +2029,9 @@ DONE-CALLBACK receives an alist of (REL-PATH . (ERR . TOKEN))."
                       (org-lark--pubstate-new-attr-tokens st))
                 (cond
                  ((eq kind 'file)
-                  (format "<file token=\"%s\" name=\"%s\"/>" token name))
+                  (org-lark--media-file-tag token name))
                  (t
-                  (format "<image token=\"%s\"%s/>" token
-                          (org-lark--rev-render-attrs attrs '("token"))))))
+                  (org-lark--media-img-tag token attrs))))
                (t
                 (org-lark--log "media failed for %s: %s" rel err)
                 (format "[%s](%s)" (or name rel) rel)))))
@@ -2151,7 +2203,7 @@ leading Markdown heading).  Calls CALLBACK (ERR DATA)."
                                (org-lark--pubstate-doc-token st)))))))))))
      ;; Create path: create with markers, then upload media against the
      ;; freshly minted doc token, then a second +update swaps the
-     ;; markers for real <image token=…/> tags.
+     ;; markers for real <img src=…/> / <source token=…/> tags.
      (t
       (org-lark--docs-create-async
        title md (org-lark--pubstate-parent st)
