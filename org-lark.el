@@ -920,8 +920,25 @@ Honours `org-lark--defer-media' the same way as `org-lark--sc-media'."
         (cl-incf n))
       n)))
 
+(defun org-lark--media-base-name (token type)
+  "Return the asset file stem for media TOKEN of TYPE (sans extension)."
+  (concat (org-lark--safe-filename token)
+          (when (string= type "whiteboard") "-wb")))
+
+(defun org-lark--media-cached (st base-name)
+  "Return an existing asset file for BASE-NAME in ST's asset dir, or nil.
+Media tokens are immutable — a token always names the same binary,
+edits mint new tokens — so a previously downloaded asset can be
+reused forever.  The extension is chosen by lark-cli at download
+time, so match the stem with any extension."
+  (let ((stem (expand-file-name base-name (org-lark--state-asset-dir st))))
+    (or (and (file-exists-p stem) stem)
+        (car (file-expand-wildcards (concat stem ".*"))))))
+
 (defun org-lark--download-media (token type st)
-  "Download media TOKEN of TYPE using ST for paths.  Return local path or nil."
+  "Download media TOKEN of TYPE using ST for paths.  Return local path or nil.
+Cache-first: an asset already present in ST's asset dir is reused
+without invoking the CLI."
   (when (and org-lark-download-media token)
     (cl-incf (org-lark--state-media-done st))
     (let ((total (org-lark--state-media-total st))
@@ -935,30 +952,34 @@ Honours `org-lark--defer-media' the same way as `org-lark--sc-media'."
            (relative-output
             (file-name-as-directory
              (file-relative-name (org-lark--state-asset-dir st) output-dir)))
-           (base-name (concat (org-lark--safe-filename token)
-                              (when (string= type "whiteboard") "-wb")))
-           (base (concat relative-output base-name))
-           (args (append (list "docs" "+media-download"
-                               "--as" org-lark-identity
-                               "--token" token "--output" base)
-                         (when type (list "--type" type))))
-           (json (condition-case err
-                     (let ((default-directory output-dir))
-                       (apply #'org-lark--run-json org-lark-cli-program args))
-                   (error (org-lark--log "media FAILED: %s" (error-message-string err))
-                          nil))))
-      (when json
-        (let ((data (alist-get 'data json)))
-          (if (alist-get 'ok json)
-              (let* ((path (or (alist-get 'saved_path data)
-                               (alist-get 'output data) base))
-                     (path (if (file-name-absolute-p path)
-                               path
-                             (expand-file-name path output-dir))))
-                (org-lark--log "  saved → %s" path)
-                path)
-            (org-lark--log "media error token=%s" token)
-            nil))))))
+           (base-name (org-lark--media-base-name token type))
+           (cached (org-lark--media-cached st base-name)))
+      (if cached
+          (progn (org-lark--log "  cached → %s" cached)
+                 cached)
+        (let* ((base (concat relative-output base-name))
+               (args (append (list "docs" "+media-download"
+                                   "--as" org-lark-identity
+                                   "--token" token "--output" base)
+                             (when type (list "--type" type))))
+               (json (condition-case err
+                         (let ((default-directory output-dir))
+                           (apply #'org-lark--run-json org-lark-cli-program args))
+                       (error (org-lark--log "media FAILED: %s"
+                                             (error-message-string err))
+                              nil))))
+          (when json
+            (let ((data (alist-get 'data json)))
+              (if (alist-get 'ok json)
+                  (let* ((path (or (alist-get 'saved_path data)
+                                   (alist-get 'output data) base))
+                         (path (if (file-name-absolute-p path)
+                                   path
+                                 (expand-file-name path output-dir))))
+                    (org-lark--log "  saved → %s" path)
+                    path)
+                (org-lark--log "media error token=%s" token)
+                nil))))))))
 
 ;;;; Placeholders ──────────────────────────────────────────────────
 
@@ -1255,44 +1276,48 @@ Call CALLBACK with (ERR FETCHED-ALIST)."
 
 (defun org-lark--download-media-async (token type st callback)
   "Async variant of `org-lark--download-media'.
-Call CALLBACK with (ERR PATH).  PATH is nil on failure."
-  (cond
-   ((not (and org-lark-download-media token))
-    (funcall callback nil nil))
-   (t
+Call CALLBACK with (ERR PATH).  PATH is nil on failure.
+Cache-first: an asset already present in ST's asset dir is reused
+without invoking the CLI."
+  (if (not (and org-lark-download-media token))
+      (funcall callback nil nil)
     (make-directory (org-lark--state-asset-dir st) t)
-    (let* ((output-dir (file-name-directory
-                        (org-lark--state-output-file st)))
-           (relative-output
-            (file-name-as-directory
-             (file-relative-name (org-lark--state-asset-dir st)
-                                 output-dir)))
-           (base-name (concat (org-lark--safe-filename token)
-                              (when (string= type "whiteboard") "-wb")))
-           (base (concat relative-output base-name))
-           (args (append (list "docs" "+media-download"
-                               "--as" org-lark-identity
-                               "--token" token "--output" base)
-                         (when type (list "--type" type))))
-           (default-directory output-dir))
-      (org-lark--log "media token=%s type=%s" token (or type "auto"))
-      (org-lark--run-json-async
-       org-lark-cli-program args
-       (lambda (err json)
-         (cond
-          (err (org-lark--log "media FAILED: %s" err)
-               (funcall callback err nil))
-          ((not (alist-get 'ok json))
-           (org-lark--log "media error token=%s" token)
-           (funcall callback "media-download API error" nil))
-          (t (let* ((data (alist-get 'data json))
-                    (path (or (alist-get 'saved_path data)
-                              (alist-get 'output data) base))
-                    (path (if (file-name-absolute-p path)
-                              path
-                            (expand-file-name path output-dir))))
-               (org-lark--log "  saved → %s" path)
-               (funcall callback nil path))))))))))
+    (let* ((base-name (org-lark--media-base-name token type))
+           (cached (org-lark--media-cached st base-name)))
+      (if cached
+          (progn
+            (org-lark--log "media token=%s cached → %s" token cached)
+            (funcall callback nil cached))
+        (let* ((output-dir (file-name-directory
+                            (org-lark--state-output-file st)))
+               (relative-output
+                (file-name-as-directory
+                 (file-relative-name (org-lark--state-asset-dir st)
+                                     output-dir)))
+               (base (concat relative-output base-name))
+               (args (append (list "docs" "+media-download"
+                                   "--as" org-lark-identity
+                                   "--token" token "--output" base)
+                             (when type (list "--type" type))))
+               (default-directory output-dir))
+          (org-lark--log "media token=%s type=%s" token (or type "auto"))
+          (org-lark--run-json-async
+           org-lark-cli-program args
+           (lambda (err json)
+             (cond
+              (err (org-lark--log "media FAILED: %s" err)
+                   (funcall callback err nil))
+              ((not (alist-get 'ok json))
+               (org-lark--log "media error token=%s" token)
+               (funcall callback "media-download API error" nil))
+              (t (let* ((data (alist-get 'data json))
+                        (path (or (alist-get 'saved_path data)
+                                  (alist-get 'output data) base))
+                        (path (if (file-name-absolute-p path)
+                                  path
+                                (expand-file-name path output-dir))))
+                   (org-lark--log "  saved → %s" path)
+                   (funcall callback nil path)))))))))))
 
 (defun org-lark--download-all-media-async (st done-callback)
   "Run every queued media job in ST in parallel.

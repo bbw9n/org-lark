@@ -912,6 +912,57 @@ never sees it; `org-lark--md-to-org-inline' is applied in each."
               "<mention-doc token=\"TKN\" type=\"docx\">**Important** Doc</mention-doc>")))
     (should (string-match-p "\\*Important\\* Doc" out))))
 
+;;; Media download cache ───────────────────────────────────────────
+
+(ert-deftest org-lark-test-media-cached-lookup ()
+  "Cache lookup finds an asset by stem, with or without an extension."
+  (let* ((dir (make-temp-file "org-lark-media-test" t))
+         (st (make-org-lark--state
+              :output-file (expand-file-name "doc.org" dir)
+              :asset-dir (expand-file-name "assets/" dir))))
+    (unwind-protect
+        (progn
+          (make-directory (org-lark--state-asset-dir st) t)
+          (should-not (org-lark--media-cached st "TKN1"))
+          (with-temp-file (expand-file-name "assets/TKN1.png" dir)
+            (insert "fake"))
+          (should (string-suffix-p "assets/TKN1.png"
+                                   (org-lark--media-cached st "TKN1")))
+          ;; Whiteboard variant has its own stem.
+          (should-not (org-lark--media-cached st "TKN1-wb"))
+          ;; Extension-less saves are found too.
+          (with-temp-file (expand-file-name "assets/TKN2" dir)
+            (insert "fake"))
+          (should (string-suffix-p "assets/TKN2"
+                                   (org-lark--media-cached st "TKN2"))))
+      (delete-directory dir t))))
+
+(ert-deftest org-lark-test-media-download-async-cache-hit ()
+  "A cached asset short-circuits the async download — no CLI call.
+Media tokens are immutable, so re-fetching a document must not
+re-download its images."
+  (let* ((dir (make-temp-file "org-lark-media-test" t))
+         (st (make-org-lark--state
+              :output-file (expand-file-name "doc.org" dir)
+              :asset-dir (expand-file-name "assets/" dir)))
+         (cli-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-lark--run-json-async)
+                   (lambda (&rest _) (cl-incf cli-calls))))
+          (make-directory (org-lark--state-asset-dir st) t)
+          (with-temp-file (expand-file-name "assets/TKN1.jpg" dir)
+            (insert "fake"))
+          (let (got)
+            ;; Cached token → callback fires synchronously, CLI untouched.
+            (org-lark--download-media-async
+             "TKN1" nil st (lambda (_err path) (setq got path)))
+            (should (string-suffix-p "assets/TKN1.jpg" got))
+            (should (= 0 cli-calls))
+            ;; Uncached token → the CLI is invoked.
+            (org-lark--download-media-async "TKN9" nil st #'ignore)
+            (should (= 1 cli-calls))))
+      (delete-directory dir t))))
+
 (provide 'org-lark-test)
 
 ;;; org-lark-test.el ends here
